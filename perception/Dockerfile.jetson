@@ -84,13 +84,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# ── OCR deps (PP-OCRv5_mobile via PaddleOCR, onnxruntime backend) ───
+# ── OCR deps (PP-OCRv6_tiny via PaddleOCR, onnxruntime backend) ───
 # NOTE: Python 3.8 + aarch64 (Jetson) — verify these wheels actually
 # install/build here; paddleocr's pinned deps sometimes lag on older
 # Python. If onnxruntime-gpu has no aarch64/JetPack-matching wheel,
-# drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv5_mobile is
+# drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv6_tiny is
 # small enough that this is still viable within the GPU<10% budget).
-# ── libffi (cv2 / paddlex import chain needs libffi.so.8 at runtime) ──
+#
 # focal（这个基础镜像的系统版本）的 apt 源里没有 libffi8 —— 这个包是从
 # Ubuntu 22.04(jammy) 才开始有的，focal 上根本找不到，不是镜像源配置问题。
 # 直接从 jammy 的 ports 源下载对应 .deb，手动装，不走 apt 依赖解析。
@@ -99,8 +99,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget && \
     dpkg -i /tmp/libffi8.deb && \
     rm -f /tmp/libffi8.deb && \
     rm -rf /var/lib/apt/lists/*
+
+# 不装 opencv-python-headless：系统自带的 cv2（上面 VOP 那段已经修过
+# mat_wrapper circular import 的那份）就够用，pip 再装一份 opencv 会跟
+# 系统那份冲突，触发 cv2.gapi 的 "partially initialized module" 报错
+# （VOP 那段代码里 `pip3 uninstall -y opencv-python opencv-python-headless`
+# 就是专门防这个的，这里不能再引入一份新的把它绕开）。
 RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
-    paddleocr onnxruntime opencv-python-headless
+    paddleocr onnxruntime
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
