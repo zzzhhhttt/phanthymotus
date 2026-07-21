@@ -111,6 +111,22 @@ RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
 # 它装的那份坏 cv2 包文件本体，这样 import cv2 时 Python 会往 sys.path 后面
 # 找，落到系统自带、已经在上面 VOP 那段修过的那份 cv2 上，两边各取所需。
 RUN rm -rf /usr/local/lib/python3.8/dist-packages/cv2
+# 上面这行删完，import cv2 会落到系统那份（/usr/lib/.../cv2/），但这份在
+# 实测中发现，只要真正跑到 bootstrap() 里加载 gapi 子模块这一步，会撞上
+# 同一个 gapi_wip_gst_GStreamerPipeline 的坏导入（这个 wheel 编译时没带
+# GStreamer 支持，但 gapi/__init__.py 的 Python 包装代码不管有没有编译
+# 进去都会去引用这个符号）。VOP 那段已有的修复只在它检测到 mat_wrapper
+# 那个具体错误时才生效，不覆盖这个 gapi 问题，这里再补一刀、无条件跳过
+# bootstrap() 里那套逐子模块加载 extra py 代码的机制，直接加载编译好的
+# .so 扩展本体（gapi 属于用不上的图执行 API，OCR 预处理不需要它）。
+RUN CV2_SO=$(find /usr/lib/python3.8/dist-packages/cv2 -name "cv2.cpython-38-*-linux-gnu.so" | head -1) && \
+    test -n "$CV2_SO" && \
+    echo "import importlib.util, sys" > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo "_spec = importlib.util.spec_from_file_location('cv2', '$CV2_SO')" >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo "_mod = importlib.util.module_from_spec(_spec)" >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo "_spec.loader.exec_module(_mod)" >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo "sys.modules['cv2'] = _mod" >> /usr/lib/python3.8/dist-packages/cv2/__init__.py
+RUN python3 -c "import cv2; print('system cv2 OK, version', cv2.__version__)"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
