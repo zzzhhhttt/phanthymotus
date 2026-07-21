@@ -106,8 +106,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget && \
 # （VOP 那段代码里 `pip3 uninstall -y opencv-python opencv-python-headless`
 # 就是专门防这个的，这里不能再引入一份新的把它绕开）。
 RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
-    paddleocr onnxruntime && \
-    pip3 uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless 2>/dev/null; true
+    paddleocr onnxruntime
+# 注意：不要在这里卸载 opencv-contrib-python —— 它是 paddlex[ocr-core] 自带的
+# 依赖，paddlex 自己的依赖检查（paddlex.utils.deps.require_extra）会在创建
+# OCR pipeline 时校验这个包是否存在，卸载了会直接报 DependencyError。
+# 之前 VOP 那段卸载 opencv-python/opencv-python-headless 是另一回事——那是
+# 因为我们之前显式多装了一份 opencv-python-headless，两个 opencv 变体同时
+# 存在才会撞上 cv2.gapi 那个坏导入；只留 opencv-contrib-python 这一份，
+# 目前看是可以正常 import 的（已经过了那一步，卡在更后面的 pipeline 创建）。
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
