@@ -54,7 +54,7 @@ class PPOCRAdapter(OCRAdapter):
         rec_model_name: str = "PP-OCRv6_tiny_rec",
         model_dir: Optional[str] = None,
         engine: str = "onnxruntime",
-        device: str = "gpu",
+        device: str = "cpu",
         use_textline_orientation: bool = False,
         use_doc_orientation_classify: bool = False,
         use_doc_unwarping: bool = False,

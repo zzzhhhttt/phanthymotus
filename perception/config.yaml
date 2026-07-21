@@ -54,4 +54,4 @@ plugins:
     rec_model: PP-OCRv6_tiny_rec
     model_dir: /opt/models/ppocr   # populated at image build time from JuiceFS, not committed to git
     engine: onnxruntime            # onnxruntime | paddle
-    device: gpu                    # gpu | cpu
+    device: cpu                    # gpu | cpu — 装的是 CPU 版 onnxruntime，且模型够小，CPU 跑也在预算内

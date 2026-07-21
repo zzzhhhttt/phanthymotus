@@ -429,7 +429,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             rec_model_name=cfg.get('rec_model', 'PP-OCRv6_tiny_rec'),
             model_dir=cfg.get('model_dir', '/opt/models/ppocr'),
             engine=cfg.get('engine', 'onnxruntime'),
-            device=cfg.get('device', 'gpu'),
+            device=cfg.get('device', 'cpu'),
         )
 
     return None
