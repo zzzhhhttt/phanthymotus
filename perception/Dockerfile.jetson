@@ -90,6 +90,11 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 # Python. If onnxruntime-gpu has no aarch64/JetPack-matching wheel,
 # drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv5_mobile is
 # small enough that this is still viable within the GPU<10% budget).
+# ── libffi (cv2 / paddlex import chain needs libffi.so.8 at runtime) ──
+# 如果这行报 "Unable to locate package libffi8"（说明这个 Jetson 基础镜像的
+# apt 源里没有这个包名/版本），改成 libffi7 或 libffi-dev 再试。
+RUN apt-get update && apt-get install -y --no-install-recommends libffi8 && \
+    rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
     paddleocr onnxruntime opencv-python-headless
 
