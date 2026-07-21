@@ -50,8 +50,8 @@ class PPOCRAdapter(OCRAdapter):
 
     def __init__(
         self,
-        det_model_name: str = "PP-OCRv5_mobile_det",
-        rec_model_name: str = "PP-OCRv5_mobile_rec",
+        det_model_name: str = "PP-OCRv6_tiny_det",
+        rec_model_name: str = "PP-OCRv6_tiny_rec",
         model_dir: Optional[str] = None,
         engine: str = "onnxruntime",
         device: str = "gpu",

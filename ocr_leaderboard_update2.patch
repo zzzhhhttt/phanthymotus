@@ -1,0 +1,100 @@
+diff -u -r '--exclude=__pycache__' a/perception/Dockerfile.jetson b/perception/Dockerfile.jetson
+--- a/perception/Dockerfile.jetson	2026-07-21 07:40:28.495309447 +0000
++++ b/perception/Dockerfile.jetson	2026-07-21 06:29:27.351727571 +0000
+@@ -84,12 +84,22 @@
+     rm -rf /var/lib/apt/lists/*
+ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+ 
++# ── OCR deps (PP-OCRv5_mobile via PaddleOCR, onnxruntime backend) ───
++# NOTE: Python 3.8 + aarch64 (Jetson) — verify these wheels actually
++# install/build here; paddleocr's pinned deps sometimes lag on older
++# Python. If onnxruntime-gpu has no aarch64/JetPack-matching wheel,
++# drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv5_mobile is
++# small enough that this is still viable within the GPU<10% budget).
++RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
++    paddleocr onnxruntime opencv-python-headless
++
+ # ── Application code ───────────────────────────────────────────────
+ WORKDIR /work
+ COPY perception/main.py    /work/main.py
+ COPY perception/plugins/   /work/plugins/
+ COPY perception/utils/     /work/utils/
+ COPY perception/config.yaml /work/config.yaml
++COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
+ 
+ EXPOSE 15720
+ EXPOSE 15721
+diff -u -r '--exclude=__pycache__' a/perception/config.yaml b/perception/config.yaml
+--- a/perception/config.yaml	2026-07-21 07:40:28.495309447 +0000
++++ b/perception/config.yaml	2026-07-21 07:39:42.146538156 +0000
+@@ -50,8 +50,8 @@
+     enabled: true
+     provider: ppocr    # openai | qwen | tesseract | google | ppocr
+     language: "zh"     # default language hint
+-    det_model: PP-OCRv5_mobile_det
+-    rec_model: PP-OCRv5_mobile_rec
++    det_model: PP-OCRv6_tiny_det   # 换成 tiny 系列，v5_mobile det+rec 合计约21MB，超过15MB上限
++    rec_model: PP-OCRv6_tiny_rec
+     model_dir: /opt/models/ppocr   # populated at image build time from JuiceFS, not committed to git
+     engine: onnxruntime            # onnxruntime | paddle
+     device: gpu                    # gpu | cpu
+diff -u -r '--exclude=__pycache__' a/perception/plugins/ocr.py b/perception/plugins/ocr.py
+--- a/perception/plugins/ocr.py	2026-07-21 07:40:28.496872058 +0000
++++ b/perception/plugins/ocr.py	2026-07-21 07:40:00.533876146 +0000
+@@ -425,8 +425,8 @@
+         # 避免其它 provider（openai/qwen/tesseract）在没装这些依赖时也报 ImportError。
+         from .ppocr_adapter import PPOCRAdapter
+         return PPOCRAdapter(
+-            det_model_name=cfg.get('det_model', 'PP-OCRv5_mobile_det'),
+-            rec_model_name=cfg.get('rec_model', 'PP-OCRv5_mobile_rec'),
++            det_model_name=cfg.get('det_model', 'PP-OCRv6_tiny_det'),
++            rec_model_name=cfg.get('rec_model', 'PP-OCRv6_tiny_rec'),
+             model_dir=cfg.get('model_dir', '/opt/models/ppocr'),
+             engine=cfg.get('engine', 'onnxruntime'),
+             device=cfg.get('device', 'gpu'),
+diff -u -r '--exclude=__pycache__' a/perception/plugins/ppocr_adapter.py b/perception/plugins/ppocr_adapter.py
+--- a/perception/plugins/ppocr_adapter.py	2026-07-21 07:40:28.496872058 +0000
++++ b/perception/plugins/ppocr_adapter.py	2026-07-21 07:39:56.311306279 +0000
+@@ -50,8 +50,8 @@
+ 
+     def __init__(
+         self,
+-        det_model_name: str = "PP-OCRv5_mobile_det",
+-        rec_model_name: str = "PP-OCRv5_mobile_rec",
++        det_model_name: str = "PP-OCRv6_tiny_det",
++        rec_model_name: str = "PP-OCRv6_tiny_rec",
+         model_dir: Optional[str] = None,
+         engine: str = "onnxruntime",
+         device: str = "gpu",
+diff -u -r '--exclude=__pycache__' a/perception/utils/model_downloader.py b/perception/utils/model_downloader.py
+--- a/perception/utils/model_downloader.py	2026-07-21 07:40:28.498643853 +0000
++++ b/perception/utils/model_downloader.py	2026-07-21 07:40:21.827462058 +0000
+@@ -16,8 +16,8 @@
+ COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
+ 
+ # 内网 JuiceFS 下载地址（榜单要求：模型不进 git，构建/启动时从这里下载）。
+-# TODO: 把 <path-on-juicefs> 换成实际路径，需要先把 PP-OCRv5_mobile_det.zip /
+-# PP-OCRv5_mobile_rec.zip 传到 JuiceFS 后，找王利民/对接同事确认这个 base 之后的具体路径。
++# TODO: 把 <path-on-juicefs> 换成实际路径，需要先把 PP-OCRv6_tiny_det.zip /
++# PP-OCRv6_tiny_rec.zip 传到 JuiceFS 后，找王利民/对接同事确认这个 base 之后的具体路径。
+ JUICEFS_BASE = "http://172.28.4.81:34567/<path-on-juicefs>"
+ 
+ 
+@@ -83,14 +83,11 @@
+         "single_file": True,
+     },
+     "ocr_det": {
+-        "url": f"{JUICEFS_BASE}/PP-OCRv5_mobile_det.zip",
+-        # TODO: 换成 `unzip -l ~/PP-OCRv5_mobile_det.zip` 结果里真实存在的文件名，
+-        # 用来判断模型是否已经下载好（避免重复下载）。
+-        "check_file": "inference.yml",
++        "url": f"{JUICEFS_BASE}/PP-OCRv6_tiny_det.zip",
++        "check_file": "inference.yml",  # 已在 PP-OCRv5_mobile 包里验证存在；PaddleX 格式一致，换 v6_tiny 后建议再核实一次
+     },
+     "ocr_rec": {
+-        "url": f"{JUICEFS_BASE}/PP-OCRv5_mobile_rec.zip",
+-        # TODO: 同上，换成 unzip -l 里真实的文件名
++        "url": f"{JUICEFS_BASE}/PP-OCRv6_tiny_rec.zip",
+         "check_file": "inference.yml",
+     },
+ }

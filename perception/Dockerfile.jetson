@@ -84,12 +84,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
+# ── OCR deps (PP-OCRv5_mobile via PaddleOCR, onnxruntime backend) ───
+# NOTE: Python 3.8 + aarch64 (Jetson) — verify these wheels actually
+# install/build here; paddleocr's pinned deps sometimes lag on older
+# Python. If onnxruntime-gpu has no aarch64/JetPack-matching wheel,
+# drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv5_mobile is
+# small enough that this is still viable within the GPU<10% budget).
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    paddleocr onnxruntime opencv-python-headless
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
 EXPOSE 15720
 EXPOSE 15721

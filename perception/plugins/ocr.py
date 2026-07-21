@@ -425,8 +425,8 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
         # 避免其它 provider（openai/qwen/tesseract）在没装这些依赖时也报 ImportError。
         from .ppocr_adapter import PPOCRAdapter
         return PPOCRAdapter(
-            det_model_name=cfg.get('det_model', 'PP-OCRv5_mobile_det'),
-            rec_model_name=cfg.get('rec_model', 'PP-OCRv5_mobile_rec'),
+            det_model_name=cfg.get('det_model', 'PP-OCRv6_tiny_det'),
+            rec_model_name=cfg.get('rec_model', 'PP-OCRv6_tiny_rec'),
             model_dir=cfg.get('model_dir', '/opt/models/ppocr'),
             engine=cfg.get('engine', 'onnxruntime'),
             device=cfg.get('device', 'gpu'),
