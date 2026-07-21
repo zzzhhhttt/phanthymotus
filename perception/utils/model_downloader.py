@@ -6,12 +6,33 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import tarfile
 import tempfile
+import time
 import zipfile
 from urllib.request import urlretrieve
 
 log = logging.getLogger(__name__)
+
+
+def _retry_urlretrieve(url: str, dest: str, name: str, reporthook=None, attempts: int = 3) -> None:
+    """urlretrieve with a couple of retries — under N-instance concurrent
+    startup, a transient timeout/connection-refused shouldn't kill the
+    whole container on the first failed attempt."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            urlretrieve(url, dest, reporthook=reporthook)
+            return
+        except Exception as e:
+            last_err = e
+            log.warning(
+                f"[model_downloader] {name}: download attempt {attempt}/{attempts} "
+                f"failed ({e}), retrying..."
+            )
+            time.sleep(2 ** attempt + random.uniform(0, 2))
+    raise RuntimeError(f"[model_downloader] {name}: download failed after {attempts} attempts") from last_err
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
@@ -107,12 +128,21 @@ def ensure_model(name: str, model_dir: str) -> None:
 
     url = info["url"]
     os.makedirs(model_dir, exist_ok=True)
+
+    # 多实例几乎同时启动时（比如评测平台一次拉起 10 个容器），大家会在同一
+    # 瞬间一起去下载模型，容易把下载源打出超时/连接失败。加个随机延迟，把
+    # 各实例的下载请求错开一点，不需要平台那边改启动节奏。
+    jitter = random.uniform(0, 8)
+    if jitter > 0.1:
+        log.info(f"[model_downloader] {name}: staggering start by {jitter:.1f}s")
+        time.sleep(jitter)
+
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
 
     if info.get("single_file"):
         # Direct file download (not an archive)
         dest = os.path.join(model_dir, info["check_file"])
-        urlretrieve(url, dest, reporthook=_progress_hook(name))
+        _retry_urlretrieve(url, dest, name, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: done.")
         return
 
@@ -126,7 +156,7 @@ def ensure_model(name: str, model_dir: str) -> None:
         tmp_path = tmp.name
 
     try:
-        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+        _retry_urlretrieve(url, tmp_path, name, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
         if suffix == ".zip":
