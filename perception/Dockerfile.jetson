@@ -90,7 +90,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 # Python. If onnxruntime-gpu has no aarch64/JetPack-matching wheel,
 # drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv5_mobile is
 # small enough that this is still viable within the GPU<10% budget).
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
     paddleocr onnxruntime opencv-python-headless
 
 # ── Application code ───────────────────────────────────────────────
