@@ -91,9 +91,13 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 # drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv5_mobile is
 # small enough that this is still viable within the GPU<10% budget).
 # ── libffi (cv2 / paddlex import chain needs libffi.so.8 at runtime) ──
-# 如果这行报 "Unable to locate package libffi8"（说明这个 Jetson 基础镜像的
-# apt 源里没有这个包名/版本），改成 libffi7 或 libffi-dev 再试。
-RUN apt-get update && apt-get install -y --no-install-recommends libffi8 && \
+# focal（这个基础镜像的系统版本）的 apt 源里没有 libffi8 —— 这个包是从
+# Ubuntu 22.04(jammy) 才开始有的，focal 上根本找不到，不是镜像源配置问题。
+# 直接从 jammy 的 ports 源下载对应 .deb，手动装，不走 apt 依赖解析。
+RUN apt-get update && apt-get install -y --no-install-recommends wget && \
+    wget -q http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/pool/main/libf/libffi/libffi8_3.4.2-4_arm64.deb -O /tmp/libffi8.deb && \
+    dpkg -i /tmp/libffi8.deb && \
+    rm -f /tmp/libffi8.deb && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
     paddleocr onnxruntime opencv-python-headless
