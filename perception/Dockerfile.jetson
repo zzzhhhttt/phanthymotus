@@ -106,7 +106,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget && \
 # （VOP 那段代码里 `pip3 uninstall -y opencv-python opencv-python-headless`
 # 就是专门防这个的，这里不能再引入一份新的把它绕开）。
 RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
-    paddleocr onnxruntime
+    paddleocr onnxruntime && \
+    pip3 uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless 2>/dev/null; true
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
