@@ -26,7 +26,7 @@ plugins:
 
   htmsg:
     enabled: true
-    namespace: ""       # auto-detect from hostname if empty
+    namespace: "robot1"   # 固定值，避免 fallback 到容器 hostname（可能是十六进制、以数字开头，ROS2 话题名不允许）
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
       angle_thresh: 0.35  # radians (~20°) — or rotated this much
@@ -40,7 +40,7 @@ plugins:
 
   vop:
     enabled: true
-    namespace: ""       # auto-detect from hostname if empty
+    namespace: "robot1"   # 同上，固定值避免同样的话题名报错
     model: "yolov8s-worldv2"
     confidence: 0.3
     classes: []         # empty = default broad set
