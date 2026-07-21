@@ -45,3 +45,13 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: ppocr    # openai | qwen | tesseract | google | ppocr
+    language: "zh"     # default language hint
+    det_model: PP-OCRv5_mobile_det
+    rec_model: PP-OCRv5_mobile_rec
+    model_dir: /opt/models/ppocr   # populated at image build time from JuiceFS, not committed to git
+    engine: onnxruntime            # onnxruntime | paddle
+    device: gpu                    # gpu | cpu

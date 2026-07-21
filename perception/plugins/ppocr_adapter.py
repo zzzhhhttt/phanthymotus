@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+plugins/ppocr_adapter.py — PPOCRAdapter: 本地轻量 OCR 适配器
+
+用于接入 plugins/ocr.py 中定义的 OCRAdapter 抽象接口，
+基于 PaddleOCR 的轻量模型（PP-OCRv5_mobile / PP-OCRv6_tiny）在本地做
+检测+识别两阶段推理，满足"模型 <15M 参数、GPU 占用 <10%"的榜单硬件约束。
+
+设计要点：
+1. 不依赖云端 API（不产生网络请求、不产生 key/quota 问题）。
+2. 模型权重不进 git 仓库（>1MB 文件禁止上传），通过环境变量指定的
+   本地路径加载（模型放 JuiceFS，镜像构建/启动时从内网地址下载到本地目录）。
+3. 默认使用 onnxruntime 推理引擎，避免在 Jetson 上还要编译/安装完整的
+   PaddlePaddle 推理框架，兼容性更好、镜像更轻。
+4. 对外接口与 ocr.py 中其它 Adapter（OpenAIVisionAdapter / QwenVLAdapter /
+   TesseractAdapter）保持一致：recognize(image_bytes, language) -> list[dict]，
+   每个 dict 包含 "text" 和 "bbox": [x1, y1, x2, y2]（像素坐标，原图尺寸）。
+
+依赖：
+    pip install paddleocr onnxruntime-gpu opencv-python-headless numpy
+    # Jetson 上如果 onnxruntime-gpu 官方 wheel 不适配 JetPack 版本，
+    # 退化装 onnxruntime（CPU 也能跑，PP-OCRv5_mobile/v6_tiny 本身就很轻）。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Optional
+
+from .ocr import OCRAdapter
+
+log = logging.getLogger(__name__)
+
+
+class PPOCRAdapter(OCRAdapter):
+    """PP-OCRv5_mobile / PP-OCRv6_tiny 本地推理适配器（det + rec 两阶段）"""
+
+    # 语言 -> 若需要针对语言切换识别模型，可以在这里做映射；
+    # PP-OCRv5_mobile_rec / PP-OCRv6_tiny_rec 本身已是多语言模型，
+    # 通常不需要按语言切模型，这里保留扩展点。
+    _LANG_HINT_MAP = {
+        "zh": "ch",
+        "zh-CN": "ch",
+        "zh-TW": "chinese_cht",
+        "en": "en",
+        "ja": "japan",
+        "ko": "korean",
+    }
+
+    def __init__(
+        self,
+        det_model_name: str = "PP-OCRv5_mobile_det",
+        rec_model_name: str = "PP-OCRv5_mobile_rec",
+        model_dir: Optional[str] = None,
+        engine: str = "onnxruntime",
+        device: str = "gpu",
+        use_textline_orientation: bool = False,
+        use_doc_orientation_classify: bool = False,
+        use_doc_unwarping: bool = False,
+        score_thresh: float = 0.5,
+    ):
+        """
+        Args:
+            det_model_name: 检测模型名，如 PP-OCRv5_mobile_det / PP-OCRv6_tiny_det
+            rec_model_name: 识别模型名，如 PP-OCRv5_mobile_rec / PP-OCRv6_tiny_rec
+            model_dir: 本地模型权重目录（不要指向 git 仓库内！权重从 JuiceFS 下载到
+                       容器内某个路径，例如 /opt/models/ppocr）。为 None 时使用
+                       PaddleOCR 默认的模型缓存路径（~/.paddlex），需要保证该路径在
+                       构建镜像时已经预热好，避免评测时现场联网下载导致超时/失败。
+            engine: "onnxruntime"（推荐，Jetson 兼容性好） 或 "paddle"（需要装
+                    paddlepaddle 推理框架，Jetson 上适配 JetPack 版本较麻烦）。
+            device: "gpu" 或 "cpu"。Jetson Orin 用 "gpu" 走 CUDA/TensorRT。
+            score_thresh: 识别置信度低于该阈值的结果会被过滤掉，避免噪声框拉低
+                          precision（榜单评测里误检的框会直接计入 FP）。
+        """
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError as e:
+            raise RuntimeError(
+                "PPOCRAdapter 需要安装 paddleocr：pip install paddleocr onnxruntime"
+            ) from e
+
+        self._score_thresh = score_thresh
+
+        # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
+        if model_dir:
+            from utils.model_downloader import ensure_model
+            ensure_model("ocr_det", os.path.join(model_dir, det_model_name))
+            ensure_model("ocr_rec", os.path.join(model_dir, rec_model_name))
+
+        kwargs = dict(
+            text_detection_model_name=det_model_name,
+            text_recognition_model_name=rec_model_name,
+            use_doc_orientation_classify=use_doc_orientation_classify,
+            use_doc_unwarping=use_doc_unwarping,
+            use_textline_orientation=use_textline_orientation,
+            device=device,
+        )
+
+        # 指定本地模型目录，避免评测环境现场联网拉模型
+        if model_dir:
+            kwargs["text_detection_model_dir"] = os.path.join(model_dir, det_model_name)
+            kwargs["text_recognition_model_dir"] = os.path.join(model_dir, rec_model_name)
+
+        # 部分 PaddleOCR 版本支持 engine 参数直接切 onnxruntime 后端；
+        # 如果你安装的版本不支持该参数，把下面这行删掉，改为在各单独
+        # 模块（TextDetection/TextRecognition）里传 engine="onnxruntime"。
+        try:
+            self._ocr = PaddleOCR(engine=engine, **kwargs)
+        except TypeError:
+            log.warning(
+                "[ppocr] installed paddleocr version does not accept `engine=`, "
+                "falling back to default backend"
+            )
+            self._ocr = PaddleOCR(**kwargs)
+
+        log.info(
+            f"[ppocr] adapter ready: det={det_model_name}, rec={rec_model_name}, "
+            f"engine={engine}, device={device}"
+        )
+
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+        import cv2
+        import numpy as np
+
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is None:
+            log.warning("[ppocr] failed to decode image bytes, skipping frame")
+            return []
+
+        results: list = []
+        try:
+            for res in self._ocr.predict(img):
+                texts = res.get("rec_texts") or []
+                scores = res.get("rec_scores") or []
+                polys = res.get("rec_polys")
+                if polys is None:
+                    polys = res.get("dt_polys") or []
+
+                for i, text in enumerate(texts):
+                    if not text:
+                        continue
+                    score = float(scores[i]) if i < len(scores) else 1.0
+                    if score < self._score_thresh:
+                        continue
+                    poly = polys[i] if i < len(polys) else None
+                    bbox = self._poly_to_bbox(poly) if poly is not None else []
+                    results.append({"text": text, "bbox": bbox, "score": score})
+        except Exception as e:
+            log.error(f"[ppocr] inference error: {e}", exc_info=True)
+            raise
+
+        return results
+
+    @staticmethod
+    def _poly_to_bbox(poly) -> list:
+        """将检测多边形（4点或多点）转成外接矩形 [x1, y1, x2, y2]"""
+        try:
+            xs = [float(p[0]) for p in poly]
+            ys = [float(p[1]) for p in poly]
+            return [int(round(min(xs))), int(round(min(ys))),
+                    int(round(max(xs))), int(round(max(ys)))]
+        except (TypeError, IndexError):
+            return []

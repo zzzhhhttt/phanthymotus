@@ -15,6 +15,11 @@ log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
+# 内网 JuiceFS 下载地址（榜单要求：模型不进 git，构建/启动时从这里下载）。
+# TODO: 把 <path-on-juicefs> 换成实际路径，需要先把 PP-OCRv5_mobile_det.zip /
+# PP-OCRv5_mobile_rec.zip 传到 JuiceFS 后，找王利民/对接同事确认这个 base 之后的具体路径。
+JUICEFS_BASE = "http://172.28.4.81:34567/<path-on-juicefs>"
+
 
 def _progress_hook(name: str):
     """Create a reporthook for urlretrieve that logs download progress."""
@@ -76,6 +81,17 @@ MODELS = {
         "url": f"{COS_BASE}/gtcrn_simple.onnx",
         "check_file": "gtcrn_simple.onnx",
         "single_file": True,
+    },
+    "ocr_det": {
+        "url": f"{JUICEFS_BASE}/PP-OCRv5_mobile_det.zip",
+        # TODO: 换成 `unzip -l ~/PP-OCRv5_mobile_det.zip` 结果里真实存在的文件名，
+        # 用来判断模型是否已经下载好（避免重复下载）。
+        "check_file": "inference.yml",
+    },
+    "ocr_rec": {
+        "url": f"{JUICEFS_BASE}/PP-OCRv5_mobile_rec.zip",
+        # TODO: 同上，换成 unzip -l 里真实的文件名
+        "check_file": "inference.yml",
     },
 }
 
