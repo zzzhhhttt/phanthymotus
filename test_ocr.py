@@ -12,6 +12,48 @@ test_ocr.py — 端到端测试 OCR 插件：喂一张真实图片进去，看�
 1. 通过 MCP HTTP 接口，告诉 OCR 插件"开始监听 /ocr_test_image 这个 topic"
 2. 把图片编码成 JPEG，发布到 /ocr_test_image
 3. 订阅 /ocr_test_image/ocr，打印 OCR 插件识别出来的结果
+
+查看: docker ps --filter "name=..."
+
+实时查看docker日志: docker logs -f phanthymotus-perception-ocr-0
+
+运行镜像
+DET_DIR=/home/develop/zhanghaotian/ocr-model-transfer/PP-OCRv6_tiny_det_onnx
+REC_DIR=/home/develop/zhanghaotian/ocr-model-transfer/PP-OCRv6_tiny_rec_onnx
+docker run -d --name phanthymotus-perception-ocr-0 --runtime nvidia --network=host --ipc=host --pid=host --privileged \
+  -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e MCP_PORT=45720 -e WS_PORT=45721 \
+  -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+  -e FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/config/fastdds_large_message.xml \
+  -e ROS_DOMAIN_ID=42 \
+  -v $DET_DIR:/opt/models/ppocr/PP-OCRv6_tiny_det \
+  -v $REC_DIR:/opt/models/ppocr/PP-OCRv6_tiny_rec \
+  ocr-test
+
+将文件放进运行的镜像
+docker cp test_ocr.py phanthymotus-perception-ocr-0:/tmp/test_ocr.py
+docker cp test_nameplate.png phanthymotus-perception-ocr-0:/tmp/test_nameplate.png
+
+运行test ocr脚本
+docker exec -it phanthymotus-perception-ocr-0 bash -c "
+  source /opt/ros/humble/install/setup.bash
+  python3 /tmp/test_ocr.py /tmp/test_nameplate.png
+"
+"""
+#!/usr/bin/env python3
+"""
+test_ocr.py — 端到端测试 OCR 插件：喂一张真实图片进去，看识别结果对不对。
+
+用法（在容器内部执行，比如 docker exec 进去跑，因为需要 rclpy 环境）：
+    python3 test_ocr.py /path/to/your/test_image.jpg
+
+如果不传图片路径，会自动生成一张写着 "HelloWorld000" 的测试图（跟郭洪杰那次
+测试同一个内容，方便对照结果）。
+
+做的事：
+1. 通过 MCP HTTP 接口，告诉 OCR 插件"开始监听 /ocr_test_image 这个 topic"
+2. 把图片编码成 JPEG，发布到 /ocr_test_image
+3. 订阅 /ocr_test_image/ocr，打印 OCR 插件识别出来的结果
 """
 import sys
 import json
@@ -24,7 +66,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
-MCP_PORT = 15720  # 跟你启动容器时传的 MCP_PORT 保持一致
+MCP_PORT = 45720  # 跟容器实际启动时传的 MCP_PORT 保持一致
 INPUT_TOPIC = "/ocr_test_image"
 
 
@@ -44,11 +86,21 @@ def start_ocr_listener():
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        print("[start] MCP response:", resp.read().decode())
+    t0 = time.monotonic()
+    print(f"[start] 发起请求... (t={t0:.3f})")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            elapsed = time.monotonic() - t0
+            print(f"[start] 收到响应，耗时 {elapsed:.3f}s")
+            print("[start] MCP response:", resp.read().decode())
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        print(f"[start] 请求异常，耗时 {elapsed:.3f}s，异常类型={type(e).__name__}: {e}")
+        raise
 
 
-def make_test_image_bytes(image_path: str | None) -> bytes:
+
+def make_test_image_bytes(image_path):
     """读一张真实图片，或者没传路径的话生成一张写字的测试图。"""
     import cv2
     import numpy as np
