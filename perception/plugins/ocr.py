@@ -588,6 +588,10 @@ class OCRPlugin:
         self._base_cfg = dict(plugin_cfg)  # 保留 config.yaml 里读到的原始配置，
                                             # 后面收到 MCP config 动作时用来合并，
                                             # 不会被空值覆盖掉
+        self._last_merged_cfg = dict(plugin_cfg)  # 用来判断后续 config 调用内容
+                                                    # 有没有真的变化，没变就跳过
+                                                    # 重建（避免每个case都重新
+                                                    # 加载模型、重建ROS2节点）
         self._adapter = _build_ocr_adapter(plugin_cfg)
         self._language = plugin_cfg.get('language', 'zh')
         self._nodes: dict[str, _OCRNode] = {}
@@ -707,17 +711,30 @@ class OCRPlugin:
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id}
             else:
-                # 关键修复：不能只用这次传进来的 cfg 重建 adapter——如果评测
+                # 关键修复1：不能只用这次传进来的 cfg 重建 adapter——如果评测
                 # 框架传的是空字符串（表示"不覆盖"），之前的写法会把
                 # config.yaml 里已经配好的 provider/model 等直接丢掉，
                 # 导致 adapter 变成 None。这里改成在原始配置上做合并。
                 merged = {**self._base_cfg, **cfg}
-                self._adapter = _build_ocr_adapter(merged)
-                self._language = merged.get('language', self._language)
-                for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
+
+                # 关键修复2：评测每处理一个 case 都会调一次 config（哪怕内容
+                # 没有任何变化）。之前的写法不管内容有没有变，每次都：
+                #   (a) 把模型重新从磁盘加载一遍、重建一次推理会话
+                #   (b) 把所有已经建好的 ROS2 节点（订阅/发布者）全部销毁重建
+                # 250 个 case 就是 250 次重复的模型加载 + 250 次 ROS2 节点
+                # 销毁重建，内存持续上涨，大概率就是这次被 OOM 杀掉的根因。
+                # 这里改成只有配置真的变化时才做这两件事。
+                if merged != getattr(self, "_last_merged_cfg", None):
+                    self._adapter = _build_ocr_adapter(merged)
+                    self._last_merged_cfg = merged
+                    self._language = merged.get('language', self._language)
+                    for key in list(self._nodes.keys()):
+                        self._nodes[key].stop()
+                        self._executor.remove_node(self._nodes[key])
+                        del self._nodes[key]
+                    log.info(f"[ocr] adapter rebuilt (config changed): provider={merged.get('provider')}")
+                else:
+                    log.debug("[ocr] config unchanged, skip adapter/node rebuild")
                 return {"status": "configured", "adapter_ok": self._adapter is not None}
 
         return None
