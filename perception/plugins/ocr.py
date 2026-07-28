@@ -685,17 +685,19 @@ class OCRPlugin:
             return self._nodes[node_key].start()
 
         elif action == "stop":
+            # 关键修复：以前这里会把节点从 executor/self._nodes 里整个摘掉、
+            # 销毁，下次 start 又要重新创建一个全新节点（含新的 ROS2 发布者、
+            # 底层 DDS 资源）。评测每处理一个 case 都要 stop 一次、下个 case
+            # 又 start 一次、且用的是同一个 topic——等于每个 case 都要创建
+            # 销毁一次节点，250 个 case 就是 250 次，是内存持续增长的一个
+            # 来源。这里改成"只暂停订阅、节点对象留着"，下次 start 直接复用
+            # 同一个节点，不用整个重建；节点对象在整个进程生命周期里数量
+            # 有限（等于同时用到的 topic 数），不会无限增长。
             if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
+                return self._nodes[instance_id].stop()
             elif not instance_id and self._nodes:
                 for key in list(self._nodes.keys()):
                     self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
                 return {"state": "idle"}
             return {"state": "idle"}
 
@@ -709,6 +711,7 @@ class OCRPlugin:
                 if instance_id in self._nodes:
                     self._nodes[instance_id].stop()
                     self._executor.remove_node(self._nodes[instance_id])
+                    self._nodes[instance_id].destroy_node()  # 同 stop 动作里的修复
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id}
             else:
@@ -732,6 +735,7 @@ class OCRPlugin:
                     for key in list(self._nodes.keys()):
                         self._nodes[key].stop()
                         self._executor.remove_node(self._nodes[key])
+                        self._nodes[key].destroy_node()  # 同上
                         del self._nodes[key]
                     log.info(f"[ocr] adapter rebuilt (config changed): provider={merged.get('provider')}")
                 else:
