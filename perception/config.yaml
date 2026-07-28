@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
@@ -19,13 +19,13 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: true
+    enabled: false
     namespace: "robot1"   # 固定值，避免 fallback 到容器 hostname（可能是十六进制、以数字开头，ROS2 话题名不允许）
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -39,7 +39,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: true
+    enabled: false
     namespace: "robot1"   # 同上，固定值避免同样的话题名报错
     model: "yolov8s-worldv2"
     confidence: 0.3
