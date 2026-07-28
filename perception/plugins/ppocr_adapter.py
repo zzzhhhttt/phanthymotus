@@ -59,6 +59,7 @@ class PPOCRAdapter(OCRAdapter):
         use_doc_orientation_classify: bool = False,
         use_doc_unwarping: bool = False,
         score_thresh: float = 0.5,
+        max_side: int = 1024,
     ):
         """
         Args:
@@ -73,6 +74,8 @@ class PPOCRAdapter(OCRAdapter):
             device: "gpu" 或 "cpu"。Jetson Orin 用 "gpu" 走 CUDA/TensorRT。
             score_thresh: 识别置信度低于该阈值的结果会被过滤掉，避免噪声框拉低
                           precision（榜单评测里误检的框会直接计入 FP）。
+            max_side: 推理前图片长边超过这个像素数就先缩小（省内存/加速），
+                      可以在 config.yaml 里通过 max_side 字段调整，不用改代码。
         """
         try:
             from paddleocr import PaddleOCR
@@ -82,6 +85,7 @@ class PPOCRAdapter(OCRAdapter):
             ) from e
 
         self._score_thresh = score_thresh
+        self._max_side = max_side
 
         # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
         if model_dir:
@@ -120,31 +124,16 @@ class PPOCRAdapter(OCRAdapter):
             f"engine={engine}, device={device}"
         )
 
-    # 推理前，图片长边超过这个像素数就先等比缩小——大图会明显拉高单次
-    # 推理的内存和耗时（评测数据集里有不少几MB的大图），tiny系列模型本身
-    # 也不需要喂那么高的分辨率才能识别清楚。1280 是个比较保守的起点，
-    # 如果发现准确率明显下降可以调大。
-    _MAX_SIDE = 1280
-
     def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+        import io
+
         import cv2
         import numpy as np
 
-        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        img, scale = self._decode_downscaled(image_bytes)
         if img is None:
             log.warning("[ppocr] failed to decode image bytes, skipping frame")
             return []
-
-        orig_h, orig_w = img.shape[:2]
-        scale = 1.0
-        longer_side = max(orig_h, orig_w)
-        if longer_side > self._MAX_SIDE:
-            scale = self._MAX_SIDE / longer_side
-            new_w = max(1, int(round(orig_w * scale)))
-            new_h = max(1, int(round(orig_h * scale)))
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            log.debug(f"[ppocr] downscaled input: {orig_w}x{orig_h} -> {new_w}x{new_h} (scale={scale:.3f})")
 
         results: list = []
         try:
@@ -174,6 +163,80 @@ class PPOCRAdapter(OCRAdapter):
             raise
 
         return results
+
+    def _decode_downscaled(self, image_bytes: bytes):
+        """解码图片，长边超过 self._max_side 就缩小。
+
+        跟"先完整解码原图、再resize缩小"不同，这里先用 PIL 只读文件头拿到
+        原始宽高（几乎不占内存，不会真正解码整张图），据此选一个合适的
+        cv2.IMREAD_REDUCED_COLOR_N 档位，让解码器在解码阶段就直接输出一张
+        小很多的图（libjpeg 等格式的解码器原生支持按 1/2、1/4、1/8 比例
+        解码，不需要先在内存里摊开一张几千万像素的完整图）。大图（比如评测
+        数据集里出现过的 6MB+ 图片）能明显降低这一步的内存峰值。
+        """
+        import cv2
+        import numpy as np
+        from PIL import Image
+        import io
+
+        orig_w = orig_h = None
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as probe:
+                orig_w, orig_h = probe.size  # 只读头信息，不解码像素数据
+        except Exception as e:
+            log.debug(f"[ppocr] PIL header probe failed ({e}), falling back to full cv2 decode")
+
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+
+        if orig_w and orig_h:
+            longer_side = max(orig_w, orig_h)
+            if longer_side > self._max_side:
+                # 选一个不会缩过头的档位：缩完之后长边仍 >= max_side，
+                # 剩下的差距交给后面的精确 cv2.resize 补齐
+                reduce_flag, reduce_factor = cv2.IMREAD_COLOR, 1
+                for flag, factor in (
+                    (cv2.IMREAD_REDUCED_COLOR_8, 8),
+                    (cv2.IMREAD_REDUCED_COLOR_4, 4),
+                    (cv2.IMREAD_REDUCED_COLOR_2, 2),
+                ):
+                    if longer_side / factor >= self._max_side:
+                        reduce_flag, reduce_factor = flag, factor
+                        break
+
+                img = cv2.imdecode(img_array, reduce_flag)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    scale = w / orig_w  # 解码器实际给出的缩放比例（不一定精确等于 1/reduce_factor）
+                    cur_longer = max(h, w)
+                    if cur_longer > self._max_side:
+                        final_scale = self._max_side / cur_longer
+                        new_w = max(1, int(round(w * final_scale)))
+                        new_h = max(1, int(round(h * final_scale)))
+                        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        scale *= final_scale
+                    log.debug(
+                        f"[ppocr] reduced decode: {orig_w}x{orig_h} -> {img.shape[1]}x{img.shape[0]} "
+                        f"(reduce_factor={reduce_factor}, final scale={scale:.3f})"
+                    )
+                    return img, scale
+                # 缩放解码失败（比如该格式的解码器不支持这个 flag），
+                # 落回完整解码 + resize 这条老路
+
+        # 走到这里说明：图片本来就不算大，或者头信息读取/缩放解码失败,
+        # 用最基础的方式完整解码，必要时再 resize 缩小
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is None:
+            return None, 1.0
+        h, w = img.shape[:2]
+        longer_side = max(h, w)
+        if longer_side > self._max_side:
+            scale = self._max_side / longer_side
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            log.debug(f"[ppocr] full-decode fallback + resize: {w}x{h} -> {new_w}x{new_h} (scale={scale:.3f})")
+            return img, scale
+        return img, 1.0
 
     @staticmethod
     def _poly_to_bbox(poly) -> list:

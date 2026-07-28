@@ -430,6 +430,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             model_dir=cfg.get('model_dir', '/opt/models/ppocr'),
             engine=cfg.get('engine', 'onnxruntime'),
             device=cfg.get('device', 'cpu'),
+            max_side=int(cfg.get('max_side', 1024)),
         )
 
     return None
