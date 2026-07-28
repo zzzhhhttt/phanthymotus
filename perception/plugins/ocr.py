@@ -431,6 +431,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             engine=cfg.get('engine', 'onnxruntime'),
             device=cfg.get('device', 'cpu'),
             max_side=int(cfg.get('max_side', 960)),
+            use_textline_orientation=bool(cfg.get('use_textline_orientation', True)),
         )
 
     return None

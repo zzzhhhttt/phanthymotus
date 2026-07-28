@@ -55,5 +55,8 @@ plugins:
     model_dir: /opt/models/ppocr   # populated at image build time from JuiceFS, not committed to git
     engine: onnxruntime            # onnxruntime | paddle
     device: cpu                    # gpu | cpu — 装的是 CPU 版 onnxruntime，且模型够小，CPU 跑也在预算内
-    max_side: 960                  # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
+    max_side: 1100                  # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
                                     # 参考同事已跑通的配置调低（原1024，可以再调大权衡准确率）
+    use_textline_orientation: true # 先判断文字方向、歪了就转正再识别，评测图片
+                                    # 里不少是拍摄角度倾斜的（发票/菜单/货架标签），
+                                    # 打开这个对识别准确率可能有帮助，开销不大
