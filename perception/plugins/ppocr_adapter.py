@@ -120,6 +120,12 @@ class PPOCRAdapter(OCRAdapter):
             f"engine={engine}, device={device}"
         )
 
+    # 推理前，图片长边超过这个像素数就先等比缩小——大图会明显拉高单次
+    # 推理的内存和耗时（评测数据集里有不少几MB的大图），tiny系列模型本身
+    # 也不需要喂那么高的分辨率才能识别清楚。1280 是个比较保守的起点，
+    # 如果发现准确率明显下降可以调大。
+    _MAX_SIDE = 1280
+
     def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         import cv2
         import numpy as np
@@ -129,6 +135,16 @@ class PPOCRAdapter(OCRAdapter):
         if img is None:
             log.warning("[ppocr] failed to decode image bytes, skipping frame")
             return []
+
+        orig_h, orig_w = img.shape[:2]
+        scale = 1.0
+        longer_side = max(orig_h, orig_w)
+        if longer_side > self._MAX_SIDE:
+            scale = self._MAX_SIDE / longer_side
+            new_w = max(1, int(round(orig_w * scale)))
+            new_h = max(1, int(round(orig_h * scale)))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            log.debug(f"[ppocr] downscaled input: {orig_w}x{orig_h} -> {new_w}x{new_h} (scale={scale:.3f})")
 
         results: list = []
         try:
@@ -147,6 +163,11 @@ class PPOCRAdapter(OCRAdapter):
                         continue
                     poly = polys[i] if i < len(polys) else None
                     bbox = self._poly_to_bbox(poly) if poly is not None else []
+                    if bbox and scale != 1.0:
+                        # 缩小图片上跑出来的 bbox，换算回原图坐标系，
+                        # 不然定位框会整体偏移、拉低评测的定位准确率
+                        inv = 1.0 / scale
+                        bbox = [int(round(v * inv)) for v in bbox]
                     results.append({"text": text, "bbox": bbox, "score": score})
         except Exception as e:
             log.error(f"[ppocr] inference error: {e}", exc_info=True)
