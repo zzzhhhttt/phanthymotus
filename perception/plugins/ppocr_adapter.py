@@ -110,13 +110,40 @@ class PPOCRAdapter(OCRAdapter):
         # 部分 PaddleOCR 版本支持 engine 参数直接切 onnxruntime 后端；
         # 如果你安装的版本不支持该参数，把下面这行删掉，改为在各单独
         # 模块（TextDetection/TextRecognition）里传 engine="onnxruntime"。
-        try:
-            self._ocr = PaddleOCR(engine=engine, **kwargs)
-        except TypeError:
-            log.warning(
-                "[ppocr] installed paddleocr version does not accept `engine=`, "
-                "falling back to default backend"
-            )
+        #
+        # 同时尝试关掉 onnxruntime 的 "memory pattern" 缓存（每种不同的输入
+        # 尺寸会各自缓存一份内存分配方案，不会自动释放）——因为每张评测
+        # 图片缩放后的具体宽高几乎都不一样，这个缓存理论上可能随着处理的
+        # case 增多而持续变大。这个写法没有在当前环境里实测确认过是否真的
+        # 生效，属于"低把握、值得一试"的优化：try/except 包住，装的
+        # PaddleOCR/PaddleX 版本如果不认这个参数格式，会自动退回不带这个
+        # 设置的初始化方式，不会导致启动失败。
+        ort_tuning_kwargs = dict(kwargs)
+        ort_tuning_kwargs["engine_config"] = {
+            "onnxruntime": {
+                "enable_mem_pattern": False,
+                "enable_cpu_mem_arena": False,
+            }
+        }
+
+        self._ocr = None
+        experimental_attempts = (
+            (dict(ort_tuning_kwargs, engine=engine), "engine= + engine_config 内存优化"),
+            (dict(kwargs, engine=engine), "仅 engine="),
+        )
+        for attempt_kwargs, desc in experimental_attempts:
+            try:
+                self._ocr = PaddleOCR(**attempt_kwargs)
+                log.info(f"[ppocr] PaddleOCR 初始化成功（{desc}）")
+                break
+            except Exception as e:
+                log.debug(f"[ppocr] 初始化失败（{desc}）：{e}，尝试下一种方式")
+                continue
+        if self._ocr is None:
+            # 最后这次不加任何实验性参数，是已经验证过能跑通的基础配置——
+            # 如果连这个都失败，说明是别的真正的问题（不是这次加的实验性
+            # 参数导致的），不再吞掉异常，让它正常报出来方便排查
+            log.warning("[ppocr] 实验性参数均不被接受，退回默认后端配置")
             self._ocr = PaddleOCR(**kwargs)
 
         log.info(
