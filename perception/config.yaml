@@ -55,5 +55,5 @@ plugins:
     model_dir: /opt/models/ppocr   # populated at image build time from JuiceFS, not committed to git
     engine: onnxruntime            # onnxruntime | paddle
     device: cpu                    # gpu | cpu — 装的是 CPU 版 onnxruntime，且模型够小，CPU 跑也在预算内
-    max_side: 1024                 # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
-                                    # 想权衡准确率可以调大（比如1280），不用改代码重新提交
+    max_side: 960                  # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
+                                    # 参考同事已跑通的配置调低（原1024，可以再调大权衡准确率）

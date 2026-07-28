@@ -59,7 +59,7 @@ class PPOCRAdapter(OCRAdapter):
         use_doc_orientation_classify: bool = False,
         use_doc_unwarping: bool = False,
         score_thresh: float = 0.5,
-        max_side: int = 1024,
+        max_side: int = 960,
     ):
         """
         Args:
@@ -111,24 +111,24 @@ class PPOCRAdapter(OCRAdapter):
         # 如果你安装的版本不支持该参数，把下面这行删掉，改为在各单独
         # 模块（TextDetection/TextRecognition）里传 engine="onnxruntime"。
         #
-        # 同时尝试关掉 onnxruntime 的 "memory pattern" 缓存（每种不同的输入
-        # 尺寸会各自缓存一份内存分配方案，不会自动释放）——因为每张评测
-        # 图片缩放后的具体宽高几乎都不一样，这个缓存理论上可能随着处理的
-        # case 增多而持续变大。这个写法没有在当前环境里实测确认过是否真的
-        # 生效，属于"低把握、值得一试"的优化：try/except 包住，装的
-        # PaddleOCR/PaddleX 版本如果不认这个参数格式，会自动退回不带这个
-        # 设置的初始化方式，不会导致启动失败。
+        # 参考另一位同事（zhitao）已经跑通的配置，把 onnxruntime 的线程数
+        # 显式限制到 1——线程越多，单个实例内部并行占用的工作内存越高，
+        # 10个实例同时跑的时候，多线程还会互相抢CPU核心。之前尝试过关掉
+        # onnxruntime 的内存池缓存（enable_mem_pattern/enable_cpu_mem_arena），
+        # 实测有一次出现单张图片耗时暴涨到110秒的异常，怀疑是"用速度换空间"
+        # 换亏了，这里改成限制线程数这个更保守、副作用更可控的方向。
+        # 同样用 try/except 包住，装的版本不认这个参数格式就自动退回。
         ort_tuning_kwargs = dict(kwargs)
         ort_tuning_kwargs["engine_config"] = {
             "onnxruntime": {
-                "enable_mem_pattern": False,
-                "enable_cpu_mem_arena": False,
+                "intra_op_num_threads": 1,
+                "inter_op_num_threads": 1,
             }
         }
 
         self._ocr = None
         experimental_attempts = (
-            (dict(ort_tuning_kwargs, engine=engine), "engine= + engine_config 内存优化"),
+            (dict(ort_tuning_kwargs, engine=engine), "engine= + 线程数限制"),
             (dict(kwargs, engine=engine), "仅 engine="),
         )
         for attempt_kwargs, desc in experimental_attempts:

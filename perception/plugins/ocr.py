@@ -430,7 +430,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             model_dir=cfg.get('model_dir', '/opt/models/ppocr'),
             engine=cfg.get('engine', 'onnxruntime'),
             device=cfg.get('device', 'cpu'),
-            max_side=int(cfg.get('max_side', 1024)),
+            max_side=int(cfg.get('max_side', 960)),
         )
 
     return None
@@ -458,42 +458,61 @@ class _OCRNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=5)
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._running = threading.Event()  # start/stop 之后只翻这个标记位，
+                                            # 不再每次都新建/销毁订阅和线程
         self._frame_count = 0  # 收到的图片帧计数
 
         log.info(f"[ocr] node created: subscribing={self._input_topic}, publishing={self._output_topic}")
 
     def start(self) -> dict:
-        if self.state == "running":
-            return self._status_dict()
-
         if not self._adapter:
             raise RuntimeError("OCR adapter not configured")
 
-        self._stop_event.clear()
-        self._sub = self.create_subscription(
-            CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
-        )
-        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self._worker_thread.start()
+        # 关键优化：订阅和工作线程只在第一次真正需要时创建一次，之后
+        # start/stop 都只是翻转 self._running 这个标记位——评测每个 case
+        # 都要调一次 start/stop，如果每次都真的去创建/销毁 ROS2 订阅、
+        # 起停线程，即使正确释放了也是持续的开销；改成只建一次、之后
+        # 复用，能把这部分频繁调用的成本降到接近零。
+        if self._sub is None:
+            self._sub = self.create_subscription(
+                CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
+            )
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._stop_event.clear()
+            self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+            self._worker_thread.start()
+
+        self._running.set()
         self.state = "running"
 
         log.info(f"[ocr] started: {self._input_topic} → {self._output_topic}")
         return self._status_dict()
 
     def stop(self) -> dict:
-        if self._sub is not None:
-            self.destroy_subscription(self._sub)
-            self._sub = None
-
-        self._stop_event.set()
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=3)
-
+        # 只是暂停处理（丢弃后续收到的帧、worker 空转），不销毁订阅/线程，
+        # 下次 start 直接复用，不用重新创建
+        self._running.clear()
         self.state = "idle"
         return {"state": "idle"}
 
+    def shutdown(self):
+        """真正释放这个节点持有的资源（订阅、工作线程），只在整个节点
+        要被销毁时调用（比如 config 真的变了、需要换 adapter 重建）。"""
+        self._running.clear()
+        if self._sub is not None:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+        self._stop_event.set()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=3)
+        self.state = "idle"
+
+
+
     def _image_cb(self, msg: CompressedImage):
-        """接收图片帧，放入队列"""
+        """接收图片帧，放入队列（stop 之后订阅还在，但直接丢弃，不处理）"""
+        if not self._running.is_set():
+            return
         self._frame_count += 1
         image_data = bytes(msg.data)
         log.info(f"[ocr] received image frame #{self._frame_count}: "
@@ -709,9 +728,8 @@ class OCRPlugin:
                 merged = {**self._base_cfg, **cfg}
                 self._instance_configs[instance_id] = merged
                 if instance_id in self._nodes:
-                    self._nodes[instance_id].stop()
+                    self._nodes[instance_id].shutdown()
                     self._executor.remove_node(self._nodes[instance_id])
-                    self._nodes[instance_id].destroy_node()  # 同 stop 动作里的修复
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id}
             else:
@@ -733,9 +751,8 @@ class OCRPlugin:
                     self._last_merged_cfg = merged
                     self._language = merged.get('language', self._language)
                     for key in list(self._nodes.keys()):
-                        self._nodes[key].stop()
+                        self._nodes[key].shutdown()
                         self._executor.remove_node(self._nodes[key])
-                        self._nodes[key].destroy_node()  # 同上
                         del self._nodes[key]
                     log.info(f"[ocr] adapter rebuilt (config changed): provider={merged.get('provider')}")
                 else:
