@@ -111,40 +111,35 @@ class PPOCRAdapter(OCRAdapter):
         # 如果你安装的版本不支持该参数，把下面这行删掉，改为在各单独
         # 模块（TextDetection/TextRecognition）里传 engine="onnxruntime"。
         #
-        # 参考另一位同事（zhitao）已经跑通的配置，把 onnxruntime 的线程数
-        # 显式限制到 1——线程越多，单个实例内部并行占用的工作内存越高，
-        # 10个实例同时跑的时候，多线程还会互相抢CPU核心。之前尝试过关掉
-        # onnxruntime 的内存池缓存（enable_mem_pattern/enable_cpu_mem_arena），
-        # 实测有一次出现单张图片耗时暴涨到110秒的异常，怀疑是"用速度换空间"
-        # 换亏了，这里改成限制线程数这个更保守、副作用更可控的方向。
-        # 同样用 try/except 包住，装的版本不认这个参数格式就自动退回。
+        # 同时传内存池优化（关闭 mem_pattern/cpu_mem_arena）和线程数限制
+        # 这两组 onnxruntime 参数——注意：之前分别单独测过这两组参数，
+        # 两次实测的崩溃点都比完全不传 engine_config 更早（分别是 case
+        # 112、118，不带 engine_config 时是 case 147），当时判断是负优化
+        # 已经撤回过一次。这次按你的判断重新加回来，用 try/except 包住，
+        # 装的版本不认这个参数格式会自动退回不带 engine_config 的写法。
         ort_tuning_kwargs = dict(kwargs)
         ort_tuning_kwargs["engine_config"] = {
             "onnxruntime": {
+                "enable_mem_pattern": False,
+                "enable_cpu_mem_arena": False,
                 "intra_op_num_threads": 1,
                 "inter_op_num_threads": 1,
             }
         }
 
-        self._ocr = None
-        experimental_attempts = (
-            (dict(ort_tuning_kwargs, engine=engine), "engine= + 线程数限制"),
-            (dict(kwargs, engine=engine), "仅 engine="),
-        )
-        for attempt_kwargs, desc in experimental_attempts:
+        try:
+            self._ocr = PaddleOCR(engine=engine, **ort_tuning_kwargs)
+            log.info("[ppocr] PaddleOCR 初始化成功（engine= + engine_config 内存优化+线程限制）")
+        except Exception as e:
+            log.warning(f"[ppocr] engine_config 内存优化+线程限制不被接受（{e}），退回仅 engine=")
             try:
-                self._ocr = PaddleOCR(**attempt_kwargs)
-                log.info(f"[ppocr] PaddleOCR 初始化成功（{desc}）")
-                break
-            except Exception as e:
-                log.debug(f"[ppocr] 初始化失败（{desc}）：{e}，尝试下一种方式")
-                continue
-        if self._ocr is None:
-            # 最后这次不加任何实验性参数，是已经验证过能跑通的基础配置——
-            # 如果连这个都失败，说明是别的真正的问题（不是这次加的实验性
-            # 参数导致的），不再吞掉异常，让它正常报出来方便排查
-            log.warning("[ppocr] 实验性参数均不被接受，退回默认后端配置")
-            self._ocr = PaddleOCR(**kwargs)
+                self._ocr = PaddleOCR(engine=engine, **kwargs)
+            except TypeError:
+                log.warning(
+                    "[ppocr] installed paddleocr version does not accept `engine=`, "
+                    "falling back to default backend"
+                )
+                self._ocr = PaddleOCR(**kwargs)
 
         log.info(
             f"[ppocr] adapter ready: det={det_model_name}, rec={rec_model_name}, "
