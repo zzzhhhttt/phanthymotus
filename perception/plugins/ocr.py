@@ -585,6 +585,9 @@ class OCRPlugin:
     PREFIX = "ocr"
 
     def __init__(self, plugin_cfg: dict, executor):
+        self._base_cfg = dict(plugin_cfg)  # 保留 config.yaml 里读到的原始配置，
+                                            # 后面收到 MCP config 动作时用来合并，
+                                            # 不会被空值覆盖掉
         self._adapter = _build_ocr_adapter(plugin_cfg)
         self._language = plugin_cfg.get('language', 'zh')
         self._nodes: dict[str, _OCRNode] = {}
@@ -695,15 +698,22 @@ class OCRPlugin:
             cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
 
             if instance_id:
-                self._instance_configs[instance_id] = cfg
+                # 每个 instance 各自的覆盖配置，同样叠加在原始配置之上
+                merged = {**self._base_cfg, **cfg}
+                self._instance_configs[instance_id] = merged
                 if instance_id in self._nodes:
                     self._nodes[instance_id].stop()
                     self._executor.remove_node(self._nodes[instance_id])
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id}
             else:
-                self._adapter = _build_ocr_adapter(cfg)
-                self._language = cfg.get('language', self._language)
+                # 关键修复：不能只用这次传进来的 cfg 重建 adapter——如果评测
+                # 框架传的是空字符串（表示"不覆盖"），之前的写法会把
+                # config.yaml 里已经配好的 provider/model 等直接丢掉，
+                # 导致 adapter 变成 None。这里改成在原始配置上做合并。
+                merged = {**self._base_cfg, **cfg}
+                self._adapter = _build_ocr_adapter(merged)
+                self._language = merged.get('language', self._language)
                 for key in list(self._nodes.keys()):
                     self._nodes[key].stop()
                     self._executor.remove_node(self._nodes[key])
