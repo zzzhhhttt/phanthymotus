@@ -136,24 +136,8 @@ COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
-# ── 按 zhitao 那份代码的思路，试一次"build时从172地址下载"（跟郭洪杰
-# 建议的方向一致），但因为这个具体路径之前反复验证过大概率下载不下来，
-# 这里用 `|| true` 让它失败也不影响构建——下面已经验证过能用的
-# "直接从仓库打进镜像" 那两行 COPY 依然会正常执行，双重保险。
-ARG OCR_JUICEFS_BASE_URL=http://172.28.4.81:34567/i-zhanghaotian
-COPY perception/utils/ocr_model_download_buildtime.py /tmp/ocr_model_download_buildtime.py
-RUN python3 /tmp/ocr_model_download_buildtime.py \
-      --base-url "${OCR_JUICEFS_BASE_URL}" \
-      --zip-name PP-OCRv6_tiny_det_onnx.zip \
-      --output-dir /opt/models/ppocr/PP-OCRv6_tiny_det \
-    && python3 /tmp/ocr_model_download_buildtime.py \
-      --base-url "${OCR_JUICEFS_BASE_URL}" \
-      --zip-name PP-OCRv6_tiny_rec_onnx.zip \
-      --output-dir /opt/models/ppocr/PP-OCRv6_tiny_rec \
-    || echo "[ocr] build-time JuiceFS download failed, will fall back to model files baked in from git repo"
-
-# OCR 模型直接从仓库打进镜像（每个文件都在 5MB 以内），不用运行时再去
-# JuiceFS 下载 —— ensure_model() 发现这两个路径下文件已经存在，会自动
+# OCR 模型直接从仓库打进镜像（每个文件都在 10MB 以内），不用运行时再去
+# JuiceFS 下载 —— ensure_model() 发现这些路径下文件已经存在，会自动
 # 跳过下载这一步。
 COPY perception/models/ppocr/PP-OCRv6_tiny_det_onnx/ /opt/models/ppocr/PP-OCRv6_tiny_det/
 COPY perception/models/ppocr/PP-OCRv6_small_det_onnx/ /opt/models/ppocr/PP-OCRv6_small_det/
