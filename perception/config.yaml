@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: false
+    enabled: true
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
@@ -13,19 +13,19 @@ plugins:
       threshold: 0.5
       silence_ms: 400
     kws:
-      enabled: false
+      enabled: true
       model_dir: /models/sherpa-onnx/kws
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: false
+    enabled: true
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: false
+    enabled: true
     namespace: "robot1"   # 固定值，避免 fallback 到容器 hostname（可能是十六进制、以数字开头，ROS2 话题名不允许）
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -39,7 +39,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: false
+    enabled: true
     namespace: "robot1"   # 同上，固定值避免同样的话题名报错
     model: "yolov8s-worldv2"
     confidence: 0.3
@@ -57,6 +57,6 @@ plugins:
     device: cpu                    # gpu | cpu — 装的是 CPU 版 onnxruntime，且模型够小，CPU 跑也在预算内
     max_side: 1100                  # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
                                     # 参考同事已跑通的配置调低（原1024，可以再调大权衡准确率）
-    use_textline_orientation: true # 先判断文字方向、歪了就转正再识别，评测图片
-                                    # 里不少是拍摄角度倾斜的（发票/菜单/货架标签），
-                                    # 打开这个对识别准确率可能有帮助，开销不大
+    use_textline_orientation: false # 实测打开后分数反而下降了（评测图片大多本来
+                                    # 就是端正的，方向判断偶尔误判、反而把原本清晰
+                                    # 的图转歪了），保持关闭

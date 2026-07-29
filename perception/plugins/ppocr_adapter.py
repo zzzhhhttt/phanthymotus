@@ -55,7 +55,7 @@ class PPOCRAdapter(OCRAdapter):
         model_dir: Optional[str] = None,
         engine: str = "onnxruntime",
         device: str = "cpu",
-        use_textline_orientation: bool = True,
+        use_textline_orientation: bool = False,
         use_doc_orientation_classify: bool = False,
         use_doc_unwarping: bool = False,
         score_thresh: float = 0.5,
