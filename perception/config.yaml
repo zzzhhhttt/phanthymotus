@@ -61,7 +61,7 @@ plugins:
     use_textline_orientation: false # 实测打开后分数反而下降了（评测图片大多本来
                                     # 就是端正的，方向判断偶尔误判、反而把原本清晰
                                     # 的图转歪了），保持关闭
-    enhance_contrast: true         # 推理前做一次局部对比度增强（CLAHE），只是
+    enhance_contrast: false         # 推理前做一次局部对比度增强（CLAHE），只是
                                     # 增强已有对比度，不是反色/二值化那种非此即彼
                                     # 的转换，几乎不增加内存；单独测试这一项，没
                                     # 跟别的改动混在一起，方便判断这项本身有没有用
