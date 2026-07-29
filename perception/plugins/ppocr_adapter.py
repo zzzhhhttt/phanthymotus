@@ -60,6 +60,7 @@ class PPOCRAdapter(OCRAdapter):
         use_doc_unwarping: bool = False,
         score_thresh: float = 0.5,
         max_side: int = 960,
+        enhance_contrast: bool = False,
     ):
         """
         Args:
@@ -86,6 +87,7 @@ class PPOCRAdapter(OCRAdapter):
 
         self._score_thresh = score_thresh
         self._max_side = max_side
+        self._enhance_contrast = enhance_contrast
 
         # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
         if model_dir:
@@ -157,6 +159,9 @@ class PPOCRAdapter(OCRAdapter):
             log.warning("[ppocr] failed to decode image bytes, skipping frame")
             return []
 
+        if self._enhance_contrast:
+            img = self._apply_clahe(img)
+
         results: list = []
         try:
             for res in self._ocr.predict(img):
@@ -185,6 +190,20 @@ class PPOCRAdapter(OCRAdapter):
             raise
 
         return results
+
+    @staticmethod
+    def _apply_clahe(img):
+        """局部对比度增强（CLAHE）——只增强原有对比度，不是"要么全用要么
+        全不用"的二元转换（跟反色/二值化那种赌注式操作不一样），对光线
+        不均、字迹偏淡的照片通常有帮助，即使图片本来就清晰，副作用一般
+        也比较小。只在 YUV 的亮度通道上做，不碰颜色信息，避免引入色偏；
+        跟输入图片同样大小，不会明显增加内存。"""
+        import cv2
+
+        yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
+        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
 
     def _decode_downscaled(self, image_bytes: bytes):
         """解码图片，长边超过 self._max_side 就缩小。

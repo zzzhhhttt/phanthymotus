@@ -432,6 +432,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             device=cfg.get('device', 'cpu'),
             max_side=int(cfg.get('max_side', 960)),
             use_textline_orientation=bool(cfg.get('use_textline_orientation', False)),
+            enhance_contrast=bool(cfg.get('enhance_contrast', True)),
         )
 
     return None
