@@ -61,6 +61,8 @@ class PPOCRAdapter(OCRAdapter):
         score_thresh: float = 0.5,
         max_side: int = 960,
         enhance_contrast: bool = False,
+        sharpen: bool = True,
+        unclip_ratio: float = 2.5,
     ):
         """
         Args:
@@ -77,6 +79,10 @@ class PPOCRAdapter(OCRAdapter):
                           precision（榜单评测里误检的框会直接计入 FP）。
             max_side: 推理前图片长边超过这个像素数就先缩小（省内存/加速），
                       可以在 config.yaml 里通过 max_side 字段调整，不用改代码。
+            unclip_ratio: 检测框往外扩张的比例，默认2.0偏保守，容易把文字边缘
+                          切掉；调大（比如2.5）能让框更完整，尤其中文，代价是
+                          可能把相邻内容也框进来。跟图片尺寸/内存无关，纯粹是
+                          检测框后处理的一个参数。
         """
         try:
             from paddleocr import PaddleOCR
@@ -88,6 +94,7 @@ class PPOCRAdapter(OCRAdapter):
         self._score_thresh = score_thresh
         self._max_side = max_side
         self._enhance_contrast = enhance_contrast
+        self._sharpen = sharpen
 
         # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
         if model_dir:
@@ -109,39 +116,59 @@ class PPOCRAdapter(OCRAdapter):
             kwargs["text_detection_model_dir"] = os.path.join(model_dir, det_model_name)
             kwargs["text_recognition_model_dir"] = os.path.join(model_dir, rec_model_name)
 
+        # unclip_ratio 单独放在一个可选的叠加层里，不直接混进上面这份
+        # "已验证能跑通的基础配置"——万一装的版本不认这个参数，最终还是
+        # 能退回到不带它的写法，不会连基础配置都跑不起来。
+        unclip_overlay = {"text_det_unclip_ratio": unclip_ratio}
+
         # 部分 PaddleOCR 版本支持 engine 参数直接切 onnxruntime 后端；
         # 如果你安装的版本不支持该参数，把下面这行删掉，改为在各单独
         # 模块（TextDetection/TextRecognition）里传 engine="onnxruntime"。
         #
-        # 同时传内存池优化（关闭 mem_pattern/cpu_mem_arena）和线程数限制
-        # 这两组 onnxruntime 参数——注意：之前分别单独测过这两组参数，
-        # 两次实测的崩溃点都比完全不传 engine_config 更早（分别是 case
-        # 112、118，不带 engine_config 时是 case 147），当时判断是负优化
-        # 已经撤回过一次。这次按你的判断重新加回来，用 try/except 包住，
-        # 装的版本不认这个参数格式会自动退回不带 engine_config 的写法。
-        ort_tuning_kwargs = dict(kwargs)
-        ort_tuning_kwargs["engine_config"] = {
-            "onnxruntime": {
-                "enable_mem_pattern": False,
-                "enable_cpu_mem_arena": False,
-                "intra_op_num_threads": 1,
-                "inter_op_num_threads": 1,
+        # engine_config 里同时传内存池优化（关闭 mem_pattern/cpu_mem_arena）
+        # 和线程数限制——注意：之前分别单独测过这两组参数，两次实测的
+        # 崩溃点都比完全不传 engine_config 更早（分别是 case 112、118，
+        # 不带 engine_config 时是 case 147），当时判断是负优化已经撤回
+        # 过一次。这次按你的判断重新加回来。
+        ort_overlay = {
+            "engine_config": {
+                "onnxruntime": {
+                    "enable_mem_pattern": False,
+                    "enable_cpu_mem_arena": False,
+                    "intra_op_num_threads": 1,
+                    "inter_op_num_threads": 1,
+                }
             }
         }
 
-        try:
-            self._ocr = PaddleOCR(engine=engine, **ort_tuning_kwargs)
-            log.info("[ppocr] PaddleOCR 初始化成功（engine= + engine_config 内存优化+线程限制）")
-        except Exception as e:
-            log.warning(f"[ppocr] engine_config 内存优化+线程限制不被接受（{e}），退回仅 engine=")
+        # 依次尝试：unclip+内存调优全带 → 只带unclip → 只带内存调优（不带engine=）
+        # → 什么额外参数都不带的基础配置。前一种失败了就自动退到下一种，
+        # 保证最坏情况下也能跑起来。
+        attempts = [
+            (dict(kwargs, **unclip_overlay, **ort_overlay), {"engine": engine}, "unclip + engine_config 内存优化+线程限制"),
+            (dict(kwargs, **unclip_overlay), {"engine": engine}, "仅 unclip_ratio + engine="),
+            (dict(kwargs, **unclip_overlay), {}, "仅 unclip_ratio（不带 engine=）"),
+            (dict(kwargs, **ort_overlay), {"engine": engine}, "仅 engine_config 内存优化+线程限制（不带unclip）"),
+            (kwargs, {"engine": engine}, "仅 engine="),
+            (kwargs, {}, "默认后端（最基础配置）"),
+        ]
+
+        self._ocr = None
+        last_err = None
+        for extra_kwargs, extra_args, desc in attempts:
             try:
-                self._ocr = PaddleOCR(engine=engine, **kwargs)
-            except TypeError:
-                log.warning(
-                    "[ppocr] installed paddleocr version does not accept `engine=`, "
-                    "falling back to default backend"
-                )
-                self._ocr = PaddleOCR(**kwargs)
+                self._ocr = PaddleOCR(**extra_args, **extra_kwargs)
+                log.info(f"[ppocr] PaddleOCR 初始化成功（{desc}）")
+                break
+            except Exception as e:
+                last_err = e
+                log.debug(f"[ppocr] 初始化失败（{desc}）：{e}，尝试下一种方式")
+                continue
+
+        if self._ocr is None:
+            raise RuntimeError(
+                f"[ppocr] PaddleOCR 初始化失败，所有已知参数组合都不被当前版本接受: {last_err}"
+            ) from last_err
 
         log.info(
             f"[ppocr] adapter ready: det={det_model_name}, rec={rec_model_name}, "
@@ -161,6 +188,9 @@ class PPOCRAdapter(OCRAdapter):
 
         if self._enhance_contrast:
             img = self._apply_clahe(img)
+
+        if self._sharpen:
+            img = self._apply_sharpen(img)
 
         results: list = []
         try:
@@ -204,6 +234,20 @@ class PPOCRAdapter(OCRAdapter):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
         return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+    @staticmethod
+    def _apply_sharpen(img):
+        """轻量锐化——一次3x3卷积，突出文字笔画边缘，对小字体/略模糊的
+        图片通常有帮助。跟CLAHE同一类操作：不改变图片尺寸，卷积核本身
+        只有9个数，几乎不占额外内存。用的是温和的锐化核（中心权重5，
+        不是更激进的写法），避免把正常清晰的图片过度锐化、引入噪点。"""
+        import cv2
+        import numpy as np
+
+        kernel = np.array([[0, -1, 0],
+                            [-1, 5, -1],
+                            [0, -1, 0]], dtype=np.float32)
+        return cv2.filter2D(img, -1, kernel)
 
     def _decode_downscaled(self, image_bytes: bytes):
         """解码图片，长边超过 self._max_side 就缩小。
