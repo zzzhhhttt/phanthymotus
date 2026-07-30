@@ -58,7 +58,7 @@ plugins:
     device: cpu                    # gpu | cpu — 装的是 CPU 版 onnxruntime，且模型够小，CPU 跑也在预算内
     max_side: 1000                  # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
                                     
-    use_textline_orientation: true # 实测打开后分数反而下降了（评测图片大多本来
+    use_textline_orientation: false # 实测打开后分数反而下降了（评测图片大多本来
                                     # 就是端正的，方向判断偶尔误判、反而把原本清晰
                                     # 的图转歪了），保持关闭
     enhance_contrast: false         # 推理前做一次局部对比度增强（CLAHE），只是
