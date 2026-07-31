@@ -66,6 +66,10 @@ class PPOCRAdapter(OCRAdapter):
         two_stage_recognition: bool = False,
         max_recrop_boxes: int = 30,
         recrop_padding: int = 18,
+        tiled_recognition: bool = False,
+        tile_size: int = 960,
+        tile_overlap_ratio: float = 0.25,
+        tile_nms_iou_thresh: float = 0.5,
     ):
         """
         Args:
@@ -103,6 +107,22 @@ class PPOCRAdapter(OCRAdapter):
                           框（按检测框面积从大到小排序，优先处理更大的文字区域）。
             recrop_padding: 裁剪每个文字框时，四周多留出的像素余量，避免刚好把
                           文字边缘切掉。
+            tiled_recognition: 默认关闭，跟 two_stage_recognition 是两套独立、
+                          互斥的策略（不要同时开）。开启后不做"先检测再挑区域
+                          裁剪"，而是不管图片内容，把原图（未缩小）机械切成一块
+                          块固定大小、互相有重叠的小方块（重叠是为了不让文字正好
+                          卡在切割线上被截断），每一块单独跑一次完整检测+识别，
+                          串行处理（一次只处理一块，不批量喂），推理时显存/内存
+                          峰值锁定在"一块"的水平，不会因为原图很大而暴涨。切完
+                          之后用 NMS 把重叠区域里被重复检测到的同一段文字去重、
+                          合并。计算量比 two_stage_recognition 大得多（不管有没有
+                          文字都要处理每一块），耗时会明显增加。
+            tile_size: tiled_recognition 开启时，每块的边长（正方形）。
+            tile_overlap_ratio: 相邻两块之间的重叠比例（0.25 = 25%），重叠是为了
+                          避免文字刚好被切割线切断、两边都识别不完整。
+            tile_nms_iou_thresh: 判断两个来自不同切块的框是不是"同一段文字被
+                          重复检测"的重合度阈值，超过这个值就用 NMS 去重、只保留
+                          置信度更高的那个。
         """
         try:
             from paddleocr import PaddleOCR
@@ -118,6 +138,10 @@ class PPOCRAdapter(OCRAdapter):
         self._two_stage_recognition = two_stage_recognition
         self._max_recrop_boxes = max_recrop_boxes
         self._recrop_padding = recrop_padding
+        self._tiled_recognition = tiled_recognition
+        self._tile_size = tile_size
+        self._tile_overlap_ratio = tile_overlap_ratio
+        self._tile_nms_iou_thresh = tile_nms_iou_thresh
 
         # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
         if model_dir:
@@ -203,6 +227,13 @@ class PPOCRAdapter(OCRAdapter):
 
         import cv2
         import numpy as np
+
+        if self._tiled_recognition:
+            try:
+                return self._tiled_predict(image_bytes)
+            except Exception as e:
+                log.error(f"[ppocr] tiled recognition failed ({e}), falling back to normal single-pass", exc_info=True)
+                # 摔倒了不整个失败，退回正常的单遍识别（下面这条老路）
 
         img, scale = self._decode_downscaled(image_bytes)
         if img is None:
@@ -463,3 +494,109 @@ class PPOCRAdapter(OCRAdapter):
         # 没有被选中重裁、或者重裁后什么都没识别出来的，保留原结果
         kept = [r for idx, r in enumerate(results) if idx not in replaced_indices]
         return kept + new_results
+
+    def _tiled_predict(self, image_bytes: bytes) -> list:
+        """滑动窗口切块识别：不管图片内容，把原图（未缩小）机械切成一块块
+        固定大小、互相有重叠的小方块，每一块单独、串行（一次一块）跑一次
+        完整检测+识别，推理时的内存/显存峰值锁定在"一块"的水平，不会因为
+        原图本身很大而暴涨。重叠区域可能让同一段文字在相邻两块里都被
+        识别到，最后用 NMS 去重。"""
+        import cv2
+        import numpy as np
+
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        full_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if full_img is None:
+            log.warning("[ppocr] failed to decode image bytes for tiled recognition")
+            return []
+        full_h, full_w = full_img.shape[:2]
+
+        tile = self._tile_size
+        stride = max(1, int(round(tile * (1 - self._tile_overlap_ratio))))
+
+        # 生成切块的左上角坐标网格，横向、纵向都按 stride 步进；
+        # 最后一块如果超出图片边界，往回收一点，保证块本身仍然是满尺寸
+        # （不产生边缘上奇形怪状的小残块），代价是最后一块和倒数第二块
+        # 的重叠区域会比设定的重叠比例更大一些，不影响正确性
+        xs = list(range(0, max(1, full_w - tile) + 1, stride)) or [0]
+        ys = list(range(0, max(1, full_h - tile) + 1, stride)) or [0]
+        if xs[-1] + tile < full_w:
+            xs.append(max(0, full_w - tile))
+        if ys[-1] + tile < full_h:
+            ys.append(max(0, full_h - tile))
+
+        all_results: list = []
+        for ty in ys:
+            for tx in xs:
+                x2 = min(full_w, tx + tile)
+                y2 = min(full_h, ty + tile)
+                patch = full_img[ty:y2, tx:x2]
+                if patch.size == 0:
+                    continue
+
+                if self._enhance_contrast:
+                    patch = self._apply_clahe(patch)
+                if self._sharpen:
+                    patch = self._apply_sharpen(patch)
+
+                # 串行：一次只处理一块，不把多块拼成一个batch一起喂进去，
+                # 这样任意时刻显存/内存占用都只对应一块的大小
+                try:
+                    patch_preds = list(self._ocr.predict(patch))
+                except Exception as e:
+                    log.debug(f"[ppocr] tile predict failed at ({tx},{ty}): {e}")
+                    continue
+
+                for res in patch_preds:
+                    texts = res.get("rec_texts") or []
+                    scores = res.get("rec_scores") or []
+                    polys = res.get("rec_polys") or res.get("dt_polys") or []
+                    for i, text in enumerate(texts):
+                        if not text:
+                            continue
+                        score = float(scores[i]) if i < len(scores) else 1.0
+                        if score < self._score_thresh:
+                            continue
+                        poly = polys[i] if i < len(polys) else None
+                        bbox = self._poly_to_bbox(poly) if poly is not None else []
+                        if bbox:
+                            # 切块内部坐标 -> 换算回完整原图坐标系
+                            bbox = [bbox[0] + tx, bbox[1] + ty, bbox[2] + tx, bbox[3] + ty]
+                        all_results.append({"text": text, "bbox": bbox, "score": score})
+
+        return self._nms_dedupe(all_results)
+
+    def _nms_dedupe(self, results: list) -> list:
+        """相邻切块的重叠区域，可能让同一段文字被重复检测出来——按置信度
+        从高到低排序，两个框的重合度（IoU）超过阈值就认为是同一段文字，
+        只保留分数更高的那个，丢弃其余的。"""
+        if not results:
+            return results
+
+        def iou(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+            inter = iw * ih
+            if inter <= 0:
+                return 0.0
+            area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+            area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+            union = area_a + area_b - inter
+            return inter / union if union > 0 else 0.0
+
+        ordered = sorted(
+            [r for r in results if len(r.get("bbox") or []) == 4],
+            key=lambda r: r["score"],
+            reverse=True,
+        )
+        no_bbox = [r for r in results if len(r.get("bbox") or []) != 4]
+
+        kept: list = []
+        for r in ordered:
+            if all(iou(r["bbox"], k["bbox"]) < self._tile_nms_iou_thresh for k in kept):
+                kept.append(r)
+
+        return kept + no_bbox

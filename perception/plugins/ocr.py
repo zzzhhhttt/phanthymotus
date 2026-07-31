@@ -437,6 +437,10 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             unclip_ratio=float(cfg.get('unclip_ratio', 2.0)),
             two_stage_recognition=bool(cfg.get('two_stage_recognition', False)),
             recrop_padding=int(cfg.get('recrop_padding', 18)),
+            tiled_recognition=bool(cfg.get('tiled_recognition', False)),
+            tile_size=int(cfg.get('tile_size', 960)),
+            tile_overlap_ratio=float(cfg.get('tile_overlap_ratio', 0.25)),
+            tile_nms_iou_thresh=float(cfg.get('tile_nms_iou_thresh', 0.5)),
         )
 
     return None
