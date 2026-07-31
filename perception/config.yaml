@@ -76,7 +76,7 @@ plugins:
                                     # 先保持关闭，确认单独测试再打开
     recrop_padding: 18               # two_stage_recognition 开启时，裁剪每个文字框
                                     # 四周多留出的像素余量，避免裁到文字边缘
-    tiled_recognition: false        # 跟 two_stage_recognition 是两套独立策略，不要
+    tiled_recognition: true        # 跟 two_stage_recognition 是两套独立策略，不要
                                     # 同时开——把原图机械切成有重叠的固定小块，逐块
                                     # 串行识别，内存/显存峰值锁定在"一块"的大小，
                                     # 不管原图多大都不会暴涨；代价是计算量比两阶段
