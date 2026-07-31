@@ -441,6 +441,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             tile_size=int(cfg.get('tile_size', 960)),
             tile_overlap_ratio=float(cfg.get('tile_overlap_ratio', 0.25)),
             tile_nms_iou_thresh=float(cfg.get('tile_nms_iou_thresh', 0.5)),
+            tile_pre_downscale_max_side=int(cfg.get('tile_pre_downscale_max_side', 2400)),
         )
 
     return None

@@ -70,6 +70,7 @@ class PPOCRAdapter(OCRAdapter):
         tile_size: int = 960,
         tile_overlap_ratio: float = 0.25,
         tile_nms_iou_thresh: float = 0.5,
+        tile_pre_downscale_max_side: int = 2400,
     ):
         """
         Args:
@@ -123,6 +124,11 @@ class PPOCRAdapter(OCRAdapter):
             tile_nms_iou_thresh: 判断两个来自不同切块的框是不是"同一段文字被
                           重复检测"的重合度阈值，超过这个值就用 NMS 去重、只保留
                           置信度更高的那个。
+            tile_pre_downscale_max_side: 切块之前，先把原图整体降到这个像素
+                          上限（默认2400，比正常路径的960宽松很多），再在这张
+                          "预缩小后的图"上切块——避免解码环节直接摊开一张原始
+                          分辨率的巨图（这是切块模式之前 OOM 的主要来源），同时
+                          依然比960清晰得多，保留切块方案本身想要的效果。
         """
         try:
             from paddleocr import PaddleOCR
@@ -142,6 +148,7 @@ class PPOCRAdapter(OCRAdapter):
         self._tile_size = tile_size
         self._tile_overlap_ratio = tile_overlap_ratio
         self._tile_nms_iou_thresh = tile_nms_iou_thresh
+        self._tile_pre_downscale_max_side = tile_pre_downscale_max_side
 
         # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
         if model_dir:
@@ -309,8 +316,9 @@ class PPOCRAdapter(OCRAdapter):
                             [0, -1, 0]], dtype=np.float32)
         return cv2.filter2D(img, -1, kernel)
 
-    def _decode_downscaled(self, image_bytes: bytes):
-        """解码图片，长边超过 self._max_side 就缩小。
+    def _decode_downscaled(self, image_bytes: bytes, max_side_override: Optional[int] = None):
+        """解码图片，长边超过 max_side（默认用 self._max_side，可以传
+        max_side_override 覆盖，比如切块模式想用一个更宽松的上限）就缩小。
 
         跟"先完整解码原图、再resize缩小"不同，这里先用 PIL 只读文件头拿到
         原始宽高（几乎不占内存，不会真正解码整张图），据此选一个合适的
@@ -324,6 +332,8 @@ class PPOCRAdapter(OCRAdapter):
         from PIL import Image
         import io
 
+        max_side = max_side_override if max_side_override is not None else self._max_side
+
         orig_w = orig_h = None
         try:
             with Image.open(io.BytesIO(image_bytes)) as probe:
@@ -335,7 +345,7 @@ class PPOCRAdapter(OCRAdapter):
 
         if orig_w and orig_h:
             longer_side = max(orig_w, orig_h)
-            if longer_side > self._max_side:
+            if longer_side > max_side:
                 # 选一个不会缩过头的档位：缩完之后长边仍 >= max_side，
                 # 剩下的差距交给后面的精确 cv2.resize 补齐
                 reduce_flag, reduce_factor = cv2.IMREAD_COLOR, 1
@@ -344,7 +354,7 @@ class PPOCRAdapter(OCRAdapter):
                     (cv2.IMREAD_REDUCED_COLOR_4, 4),
                     (cv2.IMREAD_REDUCED_COLOR_2, 2),
                 ):
-                    if longer_side / factor >= self._max_side:
+                    if longer_side / factor >= max_side:
                         reduce_flag, reduce_factor = flag, factor
                         break
 
@@ -353,8 +363,8 @@ class PPOCRAdapter(OCRAdapter):
                     h, w = img.shape[:2]
                     scale = w / orig_w  # 解码器实际给出的缩放比例（不一定精确等于 1/reduce_factor）
                     cur_longer = max(h, w)
-                    if cur_longer > self._max_side:
-                        final_scale = self._max_side / cur_longer
+                    if cur_longer > max_side:
+                        final_scale = max_side / cur_longer
                         new_w = max(1, int(round(w * final_scale)))
                         new_h = max(1, int(round(h * final_scale)))
                         img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -374,8 +384,8 @@ class PPOCRAdapter(OCRAdapter):
             return None, 1.0
         h, w = img.shape[:2]
         longer_side = max(h, w)
-        if longer_side > self._max_side:
-            scale = self._max_side / longer_side
+        if longer_side > max_side:
+            scale = max_side / longer_side
             new_w = max(1, int(round(w * scale)))
             new_h = max(1, int(round(h * scale)))
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -496,16 +506,25 @@ class PPOCRAdapter(OCRAdapter):
         return kept + new_results
 
     def _tiled_predict(self, image_bytes: bytes) -> list:
-        """滑动窗口切块识别：不管图片内容，把原图（未缩小）机械切成一块块
-        固定大小、互相有重叠的小方块，每一块单独、串行（一次一块）跑一次
-        完整检测+识别，推理时的内存/显存峰值锁定在"一块"的水平，不会因为
-        原图本身很大而暴涨。重叠区域可能让同一段文字在相邻两块里都被
-        识别到，最后用 NMS 去重。"""
+        """滑动窗口切块识别：把图片（不是完全不缩放，而是先降到一个比正常
+        识别宽松很多的中等分辨率上限，见 tile_pre_downscale_max_side）机械
+        切成一块块固定大小、互相有重叠的小方块，每一块单独、串行（一次一
+        块）跑一次完整检测+识别，推理时的内存/显存峰值锁定在"一块"的
+        水平。重叠区域可能让同一段文字在相邻两块里都被识别到，最后用
+        NMS 去重。"""
         import cv2
         import numpy as np
 
-        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-        full_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        # 关键：不是完整解码原始分辨率的大图，而是复用跟正常识别路径一样
+        # 经过验证的"边解码边缩小"逻辑，只是这里用一个宽松很多的上限
+        # （tile_pre_downscale_max_side，默认比如 2400），而不是正常路径
+        # 那个960——既避免了解码环节直接摊开一张几千万像素的原图（这是
+        # 之前 OOM 的主要来源），又依然比960高清很多，保留切块方案本身
+        # 想要的效果。pre_scale 记录了这一步缩小的比例，最后要用它把
+        # bbox 坐标换算回真正的原图坐标系。
+        full_img, pre_scale = self._decode_downscaled(
+            image_bytes, max_side_override=self._tile_pre_downscale_max_side
+        )
         if full_img is None:
             log.warning("[ppocr] failed to decode image bytes for tiled recognition")
             return []
@@ -560,8 +579,13 @@ class PPOCRAdapter(OCRAdapter):
                         poly = polys[i] if i < len(polys) else None
                         bbox = self._poly_to_bbox(poly) if poly is not None else []
                         if bbox:
-                            # 切块内部坐标 -> 换算回完整原图坐标系
+                            # 切块内部坐标 -> 换算回"预缩小后的完整图"坐标系
                             bbox = [bbox[0] + tx, bbox[1] + ty, bbox[2] + tx, bbox[3] + ty]
+                            if pre_scale != 1.0:
+                                # 再从"预缩小后的完整图"坐标系 -> 换算回真正
+                                # 的原图坐标系，跟正常路径的坐标换算是同一个道理
+                                inv = 1.0 / pre_scale
+                                bbox = [int(round(v * inv)) for v in bbox]
                         all_results.append({"text": text, "bbox": bbox, "score": score})
 
         return self._nms_dedupe(all_results)

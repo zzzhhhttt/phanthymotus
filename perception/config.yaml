@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: false
+    enabled: false 
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
@@ -13,19 +13,19 @@ plugins:
       threshold: 0.5
       silence_ms: 400
     kws:
-      enabled: false
+      enabled: false 
       model_dir: /models/sherpa-onnx/kws
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: false
+    enabled: false 
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: false
+    enabled: false 
     namespace: "robot1"   # 固定值，避免 fallback 到容器 hostname（可能是十六进制、以数字开头，ROS2 话题名不允许）
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -39,7 +39,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: false
+    enabled: false 
     namespace: "robot1"   # 同上，固定值避免同样的话题名报错
     model: "yolov8s-worldv2"
     confidence: 0.3
@@ -57,7 +57,7 @@ plugins:
     engine: onnxruntime            # onnxruntime | paddle
     device: cpu                    # gpu | cpu — 装的是 CPU 版 onnxruntime，且模型够小，CPU 跑也在预算内
     max_side: 960                  # 推理前图片长边超过这个像素数就先缩小，省内存/加速；
-                                   
+                                    # 参考同事已跑通的配置调低（原1024，可以再调大权衡准确率）
     use_textline_orientation: false # 实测打开后分数反而下降了（评测图片大多本来
                                     # 就是端正的，方向判断偶尔误判、反而把原本清晰
                                     # 的图转歪了），保持关闭
@@ -76,13 +76,17 @@ plugins:
                                     # 先保持关闭，确认单独测试再打开
     recrop_padding: 18               # two_stage_recognition 开启时，裁剪每个文字框
                                     # 四周多留出的像素余量，避免裁到文字边缘
-    tiled_recognition: true        # 跟 two_stage_recognition 是两套独立策略，不要
+    tiled_recognition: false        # 跟 two_stage_recognition 是两套独立策略，不要
                                     # 同时开——把原图机械切成有重叠的固定小块，逐块
                                     # 串行识别，内存/显存峰值锁定在"一块"的大小，
                                     # 不管原图多大都不会暴涨；代价是计算量比两阶段
                                     # 大很多（每一块不管有没有文字都要处理），耗时
                                     # 明显更长。用户要求先测试效果，暂不考虑耗时
     tile_size: 960                   # 每块的边长
-    tile_overlap_ratio: 0.2         # 相邻块之间的重叠比例，避免文字被切割线切断
+    tile_overlap_ratio: 0.25         # 相邻块之间的重叠比例，避免文字被切割线切断
     tile_nms_iou_thresh: 0.5         # 判断两个框是不是"同一段文字被重复检测"的
                                     # 重合度阈值，用于合并相邻块重叠区域的重复结果
+    tile_pre_downscale_max_side: 1400  # 切块之前，先把原图整体降到这个像素上限
+                                    # （比正常路径的960宽松很多），避免直接摊开
+                                    # 原始分辨率的巨图导致OOM，同时依然比960清晰
+                                    # 得多，保留切块方案本身的效果
