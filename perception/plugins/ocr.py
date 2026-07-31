@@ -434,6 +434,9 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             use_textline_orientation=bool(cfg.get('use_textline_orientation', False)),
             enhance_contrast=bool(cfg.get('enhance_contrast', False)),
             sharpen=bool(cfg.get('sharpen', True)),
+            unclip_ratio=float(cfg.get('unclip_ratio', 2.0)),
+            two_stage_recognition=bool(cfg.get('two_stage_recognition', False)),
+            recrop_padding=int(cfg.get('recrop_padding', 18)),
         )
 
     return None

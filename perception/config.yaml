@@ -13,7 +13,7 @@ plugins:
       threshold: 0.5
       silence_ms: 400
     kws:
-      enabled: true
+      enabled: false
       model_dir: /models/sherpa-onnx/kws
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
@@ -61,9 +61,18 @@ plugins:
     use_textline_orientation: false # 实测打开后分数反而下降了（评测图片大多本来
                                     # 就是端正的，方向判断偶尔误判、反而把原本清晰
                                     # 的图转歪了），保持关闭
-    enhance_contrast: true       # 推理前做一次局部对比度增强（CLAHE），只是
+    enhance_contrast: false        # 推理前做一次局部对比度增强（CLAHE），只是
                                     # 增强已有对比度，不是反色/二值化那种非此即彼
                                     # 的转换，几乎不增加内存；实测后关闭
     sharpen: true                   # 轻量锐化（3x3卷积），突出文字笔画边缘，对
                                     # 小字体/略模糊图片可能有帮助，同样不增加内存，
                                     # 单独测试，没跟别的改动混在一起
+    unclip_ratio: 2.0                # 检测框往外扩张的比例，默认值；实测调到2.5
+                                    # 分数下降，已改回2.0
+    two_stage_recognition: true    # 先在缩小图上检测拿到粗略框位置，再从原图
+                                    # （未缩小）裁剪+重新识别——之前用了一个没验证过
+                                    # 的独立接口实测分数暴跌，已重写成复用验证过的
+                                    # self._ocr.predict()，但还没有实际测过新版本，
+                                    # 先保持关闭，确认单独测试再打开
+    recrop_padding: 18               # two_stage_recognition 开启时，裁剪每个文字框
+                                    # 四周多留出的像素余量，避免裁到文字边缘
