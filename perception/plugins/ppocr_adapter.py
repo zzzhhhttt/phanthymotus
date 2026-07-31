@@ -62,7 +62,10 @@ class PPOCRAdapter(OCRAdapter):
         max_side: int = 960,
         enhance_contrast: bool = False,
         sharpen: bool = True,
-        unclip_ratio: float = 2.5,
+        unclip_ratio: float = 2.0,
+        two_stage_recognition: bool = False,
+        max_recrop_boxes: int = 30,
+        recrop_padding: int = 18,
     ):
         """
         Args:
@@ -83,6 +86,23 @@ class PPOCRAdapter(OCRAdapter):
                           切掉；调大（比如2.5）能让框更完整，尤其中文，代价是
                           可能把相邻内容也框进来。跟图片尺寸/内存无关，纯粹是
                           检测框后处理的一个参数。
+            two_stage_recognition: 默认关闭。开启后，先在缩小后的图上做检测拿到
+                          粗略文字框位置，再从"未缩小的原图"上把每个框对应区域
+                          （四周留 recrop_padding 像素的余量）裁出来，对每一小块
+                          单独重新跑一次完整的检测+识别（复用 self._ocr.predict()，
+                          这条路径本身已经反复验证过能正常工作）——比整体缩小
+                          再识别更清晰，尤其是小字/密集文字。代价：(1) 需要额外
+                          解码一次原始分辨率的大图用于裁剪，部分抵消了之前
+                          "先缩小再解码省内存"的优化；(2) 文字框很多的图片
+                          （评测里见过194个框的case）会显著增加推理次数、拉长
+                          耗时，用 max_recrop_boxes 限制上限。曾经用过一个未经
+                          验证的独立"只识别"接口，实测分数不升反降（怀疑是那个
+                          接口调用方式不对），已改为这个更保守、复用已验证代码
+                          路径的写法。
+            max_recrop_boxes: two_stage_recognition 开启时，最多重新识别多少个
+                          框（按检测框面积从大到小排序，优先处理更大的文字区域）。
+            recrop_padding: 裁剪每个文字框时，四周多留出的像素余量，避免刚好把
+                          文字边缘切掉。
         """
         try:
             from paddleocr import PaddleOCR
@@ -95,6 +115,9 @@ class PPOCRAdapter(OCRAdapter):
         self._max_side = max_side
         self._enhance_contrast = enhance_contrast
         self._sharpen = sharpen
+        self._two_stage_recognition = two_stage_recognition
+        self._max_recrop_boxes = max_recrop_boxes
+        self._recrop_padding = recrop_padding
 
         # 权重不进 git，容器启动时从 JuiceFS 下载到 model_dir（已存在则跳过）。
         if model_dir:
@@ -219,6 +242,12 @@ class PPOCRAdapter(OCRAdapter):
             log.error(f"[ppocr] inference error: {e}", exc_info=True)
             raise
 
+        if self._two_stage_recognition and results:
+            try:
+                results = self._recrop_and_recognize(image_bytes, results)
+            except Exception as e:
+                log.warning(f"[ppocr] two-stage re-recognition failed ({e}), keeping first-pass results")
+
         return results
 
     @staticmethod
@@ -333,3 +362,104 @@ class PPOCRAdapter(OCRAdapter):
                     int(round(max(xs))), int(round(max(ys)))]
         except (TypeError, IndexError):
             return []
+
+    def _recrop_and_recognize(self, image_bytes: bytes, results: list) -> list:
+        """按第一遍（低分辨率）检测出来的粗略框，从原始未缩小的图片上把
+        每个框对应区域裁出来（四周留 padding，避免边缘文字被切掉），
+        再对每一小块单独跑一次完整的检测+识别（复用 self._ocr.predict()，
+        这条路径已经反复验证过能正常工作，不再依赖没验证过的独立接口）。
+        跟第一遍相比，这一步是在更接近原图的分辨率下重新定位+识别，
+        对小字/密集文字区域通常更准。"""
+        import cv2
+        import numpy as np
+
+        def box_area(r):
+            b = r.get("bbox") or []
+            if len(b) != 4:
+                return 0
+            return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+        # 按框的面积从大到小排，优先重新识别更大的文字区域，
+        # 用 max_recrop_boxes 控制总数上限，避免文字框特别多的图片
+        # 耗时暴涨
+        ordered = sorted(range(len(results)), key=lambda i: box_area(results[i]), reverse=True)
+        to_recrop = ordered[: self._max_recrop_boxes]
+        if not to_recrop:
+            return results
+
+        # 这一步需要原始分辨率的图，之前为了省内存一直在避免完整解码
+        # 大图——这里是 two_stage_recognition 功能本身需要付出的代价，
+        # 默认关闭正是因为这个原因
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        full_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if full_img is None:
+            raise RuntimeError("无法解码原始图片用于裁剪")
+        full_h, full_w = full_img.shape[:2]
+
+        replaced_indices = set()
+        new_results: list = []
+
+        for i in to_recrop:
+            bbox = results[i].get("bbox") or []
+            if len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = bbox
+            pad = self._recrop_padding
+            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+            x2, y2 = min(full_w, x2 + pad), min(full_h, y2 + pad)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = full_img[y1:y2, x1:x2]
+
+            # 极少数情况下（原始框本身就很大），裁出来的小图可能还是
+            # 不小——照搬跟主流程一样的降尺寸保护，避免这一步反而喂进去
+            # 一张超大图，抵消掉本来想要的内存/速度收益
+            crop_h, crop_w = crop.shape[:2]
+            crop_scale = 1.0
+            longer = max(crop_h, crop_w)
+            if longer > self._max_side:
+                crop_scale = self._max_side / longer
+                crop = cv2.resize(
+                    crop,
+                    (max(1, int(round(crop_w * crop_scale))), max(1, int(round(crop_h * crop_scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            try:
+                crop_preds = list(self._ocr.predict(crop))
+            except Exception as e:
+                log.debug(f"[ppocr] recrop predict failed on box {i} ({e}), keeping original result")
+                continue
+
+            found_any = False
+            for res in crop_preds:
+                texts = res.get("rec_texts") or []
+                scores = res.get("rec_scores") or []
+                polys = res.get("rec_polys") or res.get("dt_polys") or []
+                for j, text in enumerate(texts):
+                    if not text:
+                        continue
+                    score = float(scores[j]) if j < len(scores) else 1.0
+                    if score < self._score_thresh:
+                        continue
+                    poly = polys[j] if j < len(polys) else None
+                    sub_bbox = self._poly_to_bbox(poly) if poly is not None else []
+                    if sub_bbox:
+                        if crop_scale != 1.0:
+                            inv = 1.0 / crop_scale
+                            sub_bbox = [v * inv for v in sub_bbox]
+                        # 裁块内部坐标 -> 换算回完整原图坐标系
+                        sub_bbox = [
+                            int(round(sub_bbox[0] + x1)), int(round(sub_bbox[1] + y1)),
+                            int(round(sub_bbox[2] + x1)), int(round(sub_bbox[3] + y1)),
+                        ]
+                    new_results.append({"text": text, "bbox": sub_bbox, "score": score})
+                    found_any = True
+
+            if found_any:
+                replaced_indices.add(i)
+
+        # 被成功重新识别过的框，用新结果替换掉原来（低分辨率下识别）的；
+        # 没有被选中重裁、或者重裁后什么都没识别出来的，保留原结果
+        kept = [r for idx, r in enumerate(results) if idx not in replaced_indices]
+        return kept + new_results
