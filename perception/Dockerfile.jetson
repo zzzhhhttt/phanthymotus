@@ -128,6 +128,14 @@ RUN CV2_SO=$(find /usr/lib/python3.8/dist-packages/cv2 -name "cv2.cpython-38-*-l
     echo "sys.modules['cv2'] = _mod" >> /usr/lib/python3.8/dist-packages/cv2/__init__.py
 RUN python3 -c "import cv2; print('system cv2 OK, version', cv2.__version__)"
 
+# ── Obstacle Distance deps (Depth Anything V2 Small metric, INT8 onnx) ──
+# 不需要 torch/transformers：模型已经离线导出+量化成 onnx（见
+# perception/plugins/obstacle_distance/export_onnx.py，一次性开发脚本，
+# 不在这个镜像里跑），运行时只用 onnxruntime 加载执行。OCR 那段已经装过
+# onnxruntime 了，这里显式再装一次是为了这段独立、不依赖 OCR 那段以后
+# 会不会被改掉（pip 对已满足的依赖是no-op，不会重复下载）。
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
@@ -142,6 +150,12 @@ COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastd
 COPY perception/models/ppocr/PP-OCRv6_tiny_det_onnx/ /opt/models/ppocr/PP-OCRv6_tiny_det/
 COPY perception/models/ppocr/PP-OCRv6_small_det_onnx/ /opt/models/ppocr/PP-OCRv6_small_det/
 COPY perception/models/ppocr/PP-OCRv6_tiny_rec_onnx/ /opt/models/ppocr/PP-OCRv6_tiny_rec/
+
+# obstacle_distance 模型同理直接打进镜像（量化后 indoor/outdoor 各 ~26MB，
+# 在榜单"模型30M以下"的文件大小限制内），DepthEstimator 默认就读仓库自带
+# 路径 perception/models/depth_anything_v2/，跟这里的 COPY 目标路径一致，
+# 不用额外设置 OBSTACLE_DISTANCE_MODEL_DIR。
+COPY perception/models/depth_anything_v2/ /work/models/depth_anything_v2/
 
 EXPOSE 15720
 EXPOSE 15721

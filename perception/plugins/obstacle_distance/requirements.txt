@@ -1,0 +1,8 @@
+# obstacle_distance 插件运行时依赖（predict.py / eval.py / plugin.py）。
+# 注意：不需要 torch / transformers ——模型已经导出成量化好的 onnx 文件
+# 放在 perception/models/depth_anything_v2/ 下，运行时只用 onnxruntime
+# 加载执行。只有重新生成模型（export_onnx.py）才需要 torch/transformers，
+# 那是一次性开发操作，依赖单独列在 export_onnx.py 的 docstring 里。
+onnxruntime
+pillow
+numpy

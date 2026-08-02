@@ -92,6 +92,11 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("obstacle_distance", {}).get("enabled", False):
+            from plugins.obstacle_distance import ObstacleDistancePlugin
+            self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle_distance"], executor))
+            log.info("ObstacleDistancePlugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:

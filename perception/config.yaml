@@ -46,6 +46,15 @@ plugins:
     classes: []         # empty = default broad set
     fps: 5
 
+  obstacle_distance:
+    enabled: true  # 独立于 ocr 之外的插件，互不影响；改这里/调这个插件的参数不会碰到 ocr 的配置
+    domain: auto     # auto（按图片格式 png=indoor/jpg=outdoor 自动判定，见榜单输入说明的等效焦距区分） | indoor | outdoor
+    percentile: 1.0  # ROI 内取第几百分位深度作为"最近障碍物距离"，对应榜单示例图里的 P1
+    device: cpu      # cpu（默认，量化模型在 GPU EP 上算子支持不稳定，CPU 单帧~150ms 仍在3秒预算内）| cuda（实验性）
+    model_dir: ""    # 留空 = 用仓库自带的 perception/models/depth_anything_v2/（已经是量化好
+                      # 的 onnx 文件，~26MB/个，在榜单"模型30M以下"的文件大小限制内）；需要用
+                      # 别的路径（比如 JuiceFS 挂载）时才填
+
   ocr:
     enabled: true
     provider: ppocr    # openai | qwen | tesseract | google | ppocr
