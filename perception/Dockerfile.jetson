@@ -85,11 +85,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
 # ── OCR deps (PP-OCRv6_tiny via PaddleOCR, onnxruntime backend) ───
-# NOTE: Python 3.8 + aarch64 (Jetson) — verify these wheels actually
-# install/build here; paddleocr's pinned deps sometimes lag on older
-# Python. If onnxruntime-gpu has no aarch64/JetPack-matching wheel,
-# drop -gpu and fall back to CPU-only onnxruntime (PP-OCRv6_tiny is
-# small enough that this is still viable within the GPU<10% budget).
+# 新版榜单文档明确写了"必须使用GPU"，是硬性要求，不是"CPU也在预算内所以
+# 随便选"——之前这里默认装 CPU 版 onnxruntime 就不合规了，改成优先装
+# onnxruntime-gpu。
+#
+# 没法在这台开发机（x86_64）上验证 Jetson（aarch64 + JetPack 5.1.1）
+# 到底有没有对应的 onnxruntime-gpu wheel——Jetson 用的是 Tegra 定制版
+# CUDA/cuDNN，跟标准 PyPI 上 onnxruntime-gpu 面向的数据中心 CUDA 不是
+# 同一套 ABI，就算 pip 能找到 aarch64 wheel 装上，也可能在真正调用时
+# 报 CUDA 版本不匹配、而不是在装的时候就报错（本地 x86_64 上实测就复现
+# 了这个问题：装上 onnxruntime-gpu 后能 import，但建 InferenceSession
+# 时因为缺运行时库静默退回 CPU）。真正"装的这个到底能不能用 GPU"的验证，
+# 挪到后面模型文件 COPY 完之后（见下面"验证 OCR 是否真的在用 GPU"那段），
+# 需要你在 jetson 盒子上 build 时親眼确认那一步的输出。
 #
 # focal（这个基础镜像的系统版本）的 apt 源里没有 libffi8 —— 这个包是从
 # Ubuntu 22.04(jammy) 才开始有的，focal 上根本找不到，不是镜像源配置问题。
@@ -100,8 +108,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget && \
     rm -f /tmp/libffi8.deb && \
     rm -rf /var/lib/apt/lists/*
 
+# 注意：这里不做"装完就验证 CUDAExecutionProvider"，因为
+# onnxruntime.get_available_providers() 只反映"编译时带了这个 provider"，
+# 不代表运行时真的能加载——本地实测过：onnxruntime-gpu 装上之后
+# get_available_providers() 照样列出 CUDAExecutionProvider，但实际建
+# InferenceSession 时因为缺 libcublasLt.so.12 之类的运行时库，会静默
+# 退回 CPUExecutionProvider，session.get_providers() 才是唯一可信的
+# "实际在用哪个 provider" 的检查方式，而这一步需要一个真实 onnx 文件才能
+# 测，模型文件要等下面 COPY 完才有，所以真正的验证挪到那之后（见下面
+# "验证 OCR 是否真的在用 GPU" 那一段），这里先只管装上。
 RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
-    paddleocr onnxruntime
+    paddleocr onnxruntime-gpu
 # 上面这行会把 opencv-contrib-python 当成 paddlex[ocr-core] 的依赖一起装上，
 # 但这份 pip 装的 cv2（具体是它的 gapi 子模块）在这个环境下有已知的坏导入
 # bug（AttributeError: gapi_wip_gst_GStreamerPipeline），装不装都不对：
@@ -142,6 +159,24 @@ COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastd
 COPY perception/models/ppocr/PP-OCRv6_tiny_det_onnx/ /opt/models/ppocr/PP-OCRv6_tiny_det/
 COPY perception/models/ppocr/PP-OCRv6_small_det_onnx/ /opt/models/ppocr/PP-OCRv6_small_det/
 COPY perception/models/ppocr/PP-OCRv6_tiny_rec_onnx/ /opt/models/ppocr/PP-OCRv6_tiny_rec/
+
+# 验证 OCR 是否真的在用 GPU（榜单硬性要求）。用真实模型文件建
+# InferenceSession，看 session.get_providers()[0] 是不是
+# CUDAExecutionProvider——这是唯一可信的检查方式（见前面 pip install
+# 那段注释：get_available_providers() 会骗人）。这里不让 build 失败
+# （万一 build 阶段本身没有 GPU/CUDA 库访问权限——取决于 Jetson 的
+# Docker daemon 有没有配置 default-runtime=nvidia，跟容器真正 docker
+# run 时能不能用 GPU 是两回事），只是把结果显眼地打印到 build 日志里，
+# 需要你在 jetson 盒子上 build 时親眼确认这一行输出的是 CUDA 还是 CPU。
+RUN python3 -c "\
+import onnxruntime as ort; \
+sess = ort.InferenceSession('/opt/models/ppocr/PP-OCRv6_small_det/inference.onnx', providers=['CUDAExecutionProvider', 'CPUExecutionProvider']); \
+providers = sess.get_providers(); \
+print('=' * 70); \
+print('[ocr] onnxruntime actual providers in use:', providers); \
+print('[ocr] GPU requirement SATISFIED' if providers[0] == 'CUDAExecutionProvider' else '[ocr] WARNING: GPU requirement NOT satisfied — running on CPU despite onnxruntime-gpu install. Needs a JetPack-matched onnxruntime build (Jetson Zoo), not plain PyPI onnxruntime-gpu.'); \
+print('=' * 70) \
+"
 
 EXPOSE 15720
 EXPOSE 15721

@@ -53,6 +53,8 @@ test_ocr.py — 端到端测试 OCR 插件：喂一张真实图片进去，看�
 做的事：
 1. 通过 MCP HTTP 接口，告诉 OCR 插件"开始监听 /ocr_test_image 这个 topic"
 2. 把图片编码成 JPEG，发布到 /ocr_test_image
+
+
 3. 订阅 /ocr_test_image/ocr，打印 OCR 插件识别出来的结果
 """
 import sys
@@ -187,3 +189,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+env:
+  - name: PHANTHYMOTUS_COMMIT_ID
+    value: "49c23bd4e5e297d92303b481e72f4b2db5ba89e0"
+  - name: PHANTHYMOTUS_REPO
+    value: "https://github.com/zzzhhhttt/phanthymotus.git"
+
+"""
