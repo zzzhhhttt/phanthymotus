@@ -89,15 +89,20 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 # 随便选"——之前这里默认装 CPU 版 onnxruntime 就不合规了，改成优先装
 # onnxruntime-gpu。
 #
-# 没法在这台开发机（x86_64）上验证 Jetson（aarch64 + JetPack 5.1.1）
-# 到底有没有对应的 onnxruntime-gpu wheel——Jetson 用的是 Tegra 定制版
-# CUDA/cuDNN，跟标准 PyPI 上 onnxruntime-gpu 面向的数据中心 CUDA 不是
-# 同一套 ABI，就算 pip 能找到 aarch64 wheel 装上，也可能在真正调用时
-# 报 CUDA 版本不匹配、而不是在装的时候就报错（本地 x86_64 上实测就复现
-# 了这个问题：装上 onnxruntime-gpu 后能 import，但建 InferenceSession
-# 时因为缺运行时库静默退回 CPU）。真正"装的这个到底能不能用 GPU"的验证，
-# 挪到后面模型文件 COPY 完之后（见下面"验证 OCR 是否真的在用 GPU"那段），
-# 需要你在 jetson 盒子上 build 时親眼确认那一步的输出。
+# 实测结果（2026-08-03 在 jetson 盒子上 build 时报的错，不是猜测）：
+#   ERROR: Could not find a version that satisfies the requirement onnxruntime-gpu
+#   ERROR: No matching distribution found for onnxruntime-gpu
+# tsinghua 镜像（镜像的是标准 PyPI）对 aarch64 + Python 3.8 根本没有
+# onnxruntime-gpu 这个 wheel——不是"装了但跑不了"，是压根找不到，导致
+# build 直接失败。Jetson 用的是 Tegra 定制版 CUDA/cuDNN，NVIDIA 把对应
+# 的 onnxruntime-gpu wheel 单独发布在 Jetson AI Lab 的包索引上（不在
+# 标准 PyPI 上），下面改成优先试这个索引，找不到就退回 tsinghua 镜像
+# 试一次（大概率也没有，留着无害），最后兜底装 CPU 版保证 build 不会
+# 再失败——但如果最终真的走到 CPU 兜底，就还是不满足"必须使用GPU"，
+# 需要看"验证 OCR 是否真的在用 GPU"那段的 build 日志输出来确认，
+# 这个 Jetson AI Lab 索引地址我没法在这台开发机上验证是否真的对得上
+# JetPack 5.1.1（jp511），只是根据这块板子已知的定制 CUDA/cuDNN 问题
+# 选的一个大概率能用的地址，需要你在实际 build 时确认。
 #
 # focal（这个基础镜像的系统版本）的 apt 源里没有 libffi8 —— 这个包是从
 # Ubuntu 22.04(jammy) 才开始有的，focal 上根本找不到，不是镜像源配置问题。
@@ -117,8 +122,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget && \
 # "实际在用哪个 provider" 的检查方式，而这一步需要一个真实 onnx 文件才能
 # 测，模型文件要等下面 COPY 完才有，所以真正的验证挪到那之后（见下面
 # "验证 OCR 是否真的在用 GPU" 那一段），这里先只管装上。
-RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} \
-    paddleocr onnxruntime-gpu
+RUN pip3 install --no-cache-dir --ignore-installed PyYAML -i ${PYPI_MIRROR} paddleocr && \
+    ( \
+      pip3 install --no-cache-dir --extra-index-url https://pypi.jetson-ai-lab.dev/jp5/cu114 onnxruntime-gpu \
+      || pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime-gpu \
+      || ( \
+        echo "[ocr] WARNING: no onnxruntime-gpu wheel found (tried Jetson AI Lab jp5/cu114 + ${PYPI_MIRROR}) — falling back to CPU onnxruntime. This does NOT satisfy the leaderboard's mandatory GPU requirement, needs manual fix (find the correct JetPack-matched wheel)." && \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime \
+      ) \
+    )
 # 上面这行会把 opencv-contrib-python 当成 paddlex[ocr-core] 的依赖一起装上，
 # 但这份 pip 装的 cv2（具体是它的 gapi 子模块）在这个环境下有已知的坏导入
 # bug（AttributeError: gapi_wip_gst_GStreamerPipeline），装不装都不对：
