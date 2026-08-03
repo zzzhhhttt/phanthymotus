@@ -4,9 +4,15 @@ plugins/obstacle_distance/plugin.py — ObstacleDistancePlugin：正前方最近
 障碍物距离感知，接入 Perception Stack 的 ROS2/MCP 插件体系。
 
 架构完全参照 plugins/ocr.py（订阅 image/jpeg topic、后台线程消费队列、
-发布 JSON 结果到 "{input_topic}/obstacle_distance"），但代码物理上跟
+发布 JSON 结果到 "{input_topic}/obstacle"），但代码物理上跟
 ocr.py/ppocr_adapter.py 完全独立，互不引用，方便分开维护 OCR 和这个
 插件（比如各自单独调参、单独发版）。
+
+MCP 工具名固定叫 "obstacle"（不是 "obstacle_distance"）——评测框架用
+环境变量 OBSTACLE_PLUGIN=obstacle 固定调用这个工具名，实测调成
+"obstacle_distance" 会导致每个 case 直接报 "Unknown tool: obstacle"，
+全部评测失败（见 2026-08-03 那次 judge flow 日志）。PREFIX 必须严格等于
+"obstacle"，Python 包名/目录名 obstacle_distance 不用改，两者互不相干。
 
 start/stop/config 沿用 ocr.py 里踩过的坑（见其大段注释）：
   - start/stop 只翻转运行标记位，不销毁重建 ROS2 订阅/线程；
@@ -43,7 +49,7 @@ _LOW_LAT_QOS = QoSProfile(
 
 TOOLS = [
     {
-        "name": "obstacle_distance",
+        "name": "obstacle",
         "type": "processor",
         "multiInstance": True,
         "description": "Obstacle Distance — nearest-obstacle-in-front distance (meters) via monocular metric depth",
@@ -91,11 +97,11 @@ class _ObstacleDistanceNode(Node):
 
     def __init__(self, input_topic: str, estimator: DepthEstimator, domain_cfg: str,
                  percentile: float, node_suffix: str = ''):
-        node_name = f"obstacle_distance_{node_suffix}" if node_suffix else "obstacle_distance"
+        node_name = f"obstacle_{node_suffix}" if node_suffix else "obstacle"
         super().__init__(node_name)
 
         self._input_topic = input_topic
-        self._output_topic = f"{input_topic}/obstacle_distance"
+        self._output_topic = f"{input_topic}/obstacle"
         self._estimator = estimator
         self._domain_cfg = domain_cfg  # "auto" | "indoor" | "outdoor"
         self._percentile = percentile
@@ -202,7 +208,7 @@ class _ObstacleDistanceNode(Node):
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
 class ObstacleDistancePlugin:
-    PREFIX = "obstacle_distance"
+    PREFIX = "obstacle"  # MCP 工具名，必须跟评测框架的 OBSTACLE_PLUGIN=obstacle 一致
 
     def __init__(self, plugin_cfg: dict, executor):
         self._base_cfg = dict(plugin_cfg)
@@ -221,7 +227,7 @@ class ObstacleDistancePlugin:
         return TOOLS
 
     def dispatch(self, name: str, args: dict) -> dict | None:
-        action = args.get("action") if name == "obstacle_distance" else name
+        action = args.get("action") if name == "obstacle" else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
@@ -230,7 +236,7 @@ class ObstacleDistancePlugin:
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
                 return {
-                    "name": "ObstacleDistance", "manufacture": "Embodied", "model": "obstacle_distance",
+                    "name": "ObstacleDistance", "manufacture": "Embodied", "model": "obstacle",
                     "state": node.state,
                     "topic_in": [{"topic": node._input_topic, "format": "image/jpeg", "desc": ""}],
                     "topic_out": [{"topic": node._output_topic, "format": "data/json", "desc": ""}],
@@ -243,13 +249,13 @@ class ObstacleDistancePlugin:
                 states = list(set(n.state for n in self._nodes.values()))
                 state = "running" if "running" in states else (states[0] if states else "idle")
             else:
-                inferred_out = f"{input_topic}/obstacle_distance" if input_topic else ""
+                inferred_out = f"{input_topic}/obstacle" if input_topic else ""
                 topics_in = [{"topic": input_topic, "format": "image/jpeg", "desc": ""}] if input_topic else []
                 topics_out = [{"topic": inferred_out, "format": "data/json", "desc": ""}] if inferred_out else []
                 state = "idle"
 
             return {
-                "name": "ObstacleDistance", "manufacture": "Embodied", "model": "obstacle_distance",
+                "name": "ObstacleDistance", "manufacture": "Embodied", "model": "obstacle",
                 "state": state,
                 "topic_in": topics_in,
                 "topic_out": topics_out,

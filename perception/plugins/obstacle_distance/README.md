@@ -83,14 +83,19 @@ image,gt_distance,domain
 
 ### 接入 Perception Stack（ROS2/MCP，真正喂给 Core 层）
 
-`config.yaml` 里 `plugins.obstacle_distance.enabled: true` 即可加载，
-`main.py` 已经接好了加载逻辑（跟 `ocr` 平级、互不影响）。MCP 工具名
-`obstacle_distance`，用法跟 `ocr` 插件一致：
+`config.yaml` 里 `plugins.obstacle_distance.enabled: true` 即可加载
+（这个 key 只是 config.yaml/main.py 内部的分组名，可以跟 MCP 工具名不
+一样）。`main.py` 已经接好了加载逻辑（跟 `ocr` 平级、互不影响）。
+
+**MCP 工具名是 `obstacle`，不是 `obstacle_distance`**——榜单评测框架固定
+用环境变量 `OBSTACLE_PLUGIN=obstacle` 去调用，工具名对不上会导致每个
+case 直接报 `Unknown tool: obstacle`、全部评测失败（踩过这个坑，
+2026-08-03 的 judge flow 日志里能看到）。用法：
 
 ```
-obstacle_distance(action=start, input_topic=/hostname/camera/rgb)
+obstacle(action=start, input_topic=/benchmark/camera/image/xxx)
 # 之后持续把 {"pred_distance": ..., "timestamp": ...} 发布到
-# /hostname/camera/rgb/obstacle_distance
+# /benchmark/camera/image/xxx/obstacle
 ```
 
 ## 模型权重
