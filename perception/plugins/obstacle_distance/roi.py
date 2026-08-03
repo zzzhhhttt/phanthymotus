@@ -44,14 +44,37 @@ def indoor_roi(width: int, height: int) -> RoiBox:
 
 
 def outdoor_roi(width: int, height: int) -> RoiBox:
-    """无人车 ROI 近似：col 1/3~2/3（前向中心车道），row 1/4~7/8
-    （裁掉上方 1/4 天空/远景，下方留到 7/8 因为车头本身较低、近距离
-    障碍物在画面里位置更靠下，跟室内机器人 0~5/8 的假设不一样）。"""
+    """无人车 ROI 近似。
+
+    2026-08-03 实测发现一次真实评测（36 个 nuScenes CAM_FRONT case）
+    F1@1m 精确等于 0.0000，RMSE 却是正常值（4.42m）、失败率 0——说明
+    模型稳定跑出了数值，但从来没预测出过 <1m 的距离。怀疑原因：旧版本
+    这里只取 col 1/3~2/3（画面水平方向只留中间 1/3），而车头正前方
+    1 米以内的障碍物在近焦广角前视摄像头画面里通常大到会顶到画面两侧
+    甚至顶部——旧的窄 ROI 很可能直接把"真正最近的那个面"裁在框外，
+    导致 P1 百分位数算出来的是框内某个更远的背景/相邻物体，而不是
+    真正最近的障碍物表面。
+
+    改成尽量宽的裁剪（只留一点点边缘，避开广角镜头边缘畸变最严重的
+    区域），理由是：nearest_obstacle_distance 取的是低百分位数（默认
+    P1），本质是只关心 ROI 内"最近的那一小撮像素"——多裁进来一些远处
+    背景/天空完全不影响这个低百分位统计（它们只是分布里"更远"的那一
+    端，会被忽略），唯一的风险是可能框进来一些不该算作障碍物的静态
+    结构（路灯、护栏，见 README Limitations），但眼下 recall=0 这个
+    问题更致命、优先级更高，值得先用这个更宽的框把"漏检"降下来，
+    之后再视实际评测结果决定要不要收窄换 precision。
+
+    这个改动没有 case 级别的 GT 数据验证过（拿不到 /tmp/oss 上的
+    detailed_cases.json），是基于代码逻辑推理出的最大嫌疑点，不是
+    确认过的根因——如果这次结果还是 F1=0，说明问题出在别处（比如这批
+    36 个 case 的 GT 里可能压根没有 <1m 的样本，那是数据集本身的
+    特性，不是这份 ROI 能解决的，需要找平台方确认）。
+    """
     return RoiBox(
-        row_start=round(height / 4),
-        row_end=max(1, round(height * 7 / 8)),
-        col_start=round(width / 3),
-        col_end=round(width * 2 / 3),
+        row_start=round(height / 8),
+        row_end=height,
+        col_start=round(width / 12),
+        col_end=round(width * 11 / 12),
     )
 
 
