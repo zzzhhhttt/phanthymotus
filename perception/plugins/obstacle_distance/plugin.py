@@ -40,6 +40,15 @@ from .predict import predict_distance
 
 log = logging.getLogger(__name__)
 
+# 参考实现（官方脚手架 plugins/obstacle.py，多个 provider 的容错兜底都是
+# 这个值）在解析失败/没有障碍物时统一返回一个具体的"很远"数值，从不发
+# null——大概率是因为下游评测框架直接当 float 用，null 可能导致解析
+# 报错或者被意外强转成 0.0（0.0 < 1m 会被误判成假阳性，拉低 precision）。
+# predict.py 自己的 predict_distance() 保留 None 语义不变（我们自己的
+# eval.py/CLI 需要用 None 来统计"推理失败率"），只在真正发布给 MCP/ROS2
+# 的这一层做兜底转换。
+_FAILURE_FALLBACK_DISTANCE = 10.0
+
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
@@ -181,18 +190,20 @@ class _ObstacleDistanceNode(Node):
                     image_bytes, filename=filename, domain=domain,
                     percentile=self._percentile, estimator=self._estimator,
                 )
+                if result.get("pred_distance") is None:
+                    log.warning(f"[obstacle_distance] inference failed: {result.get('error')}")
+                    result = {**result, "pred_distance": _FAILURE_FALLBACK_DISTANCE}
                 payload = {**result, "timestamp": ts}
                 msg = String()
                 msg.data = json.dumps(payload, ensure_ascii=False)
                 self._pub.publish(msg)
-                if result.get("pred_distance") is None:
-                    log.warning(f"[obstacle_distance] inference failed: {result.get('error')}")
             except Exception as e:
                 log.error(f"[obstacle_distance] worker error: {e}", exc_info=True)
                 try:
                     msg = String()
-                    msg.data = json.dumps({"pred_distance": None, "error": str(e), "timestamp": ts},
-                                           ensure_ascii=False)
+                    msg.data = json.dumps(
+                        {"pred_distance": _FAILURE_FALLBACK_DISTANCE, "error": str(e), "timestamp": ts},
+                        ensure_ascii=False)
                     self._pub.publish(msg)
                 except Exception:
                     pass
