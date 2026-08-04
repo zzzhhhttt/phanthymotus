@@ -26,27 +26,45 @@ from typing import Optional
 
 from .depth_model import DepthEstimator, get_default_estimator, load_image
 from .domain import Domain, detect_domain
-from .roi import indoor_roi, nearest_obstacle_distance, outdoor_roi
+from .roi import indoor_roi, nearest_obstacle_pixel, outdoor_roi
 
 _ROUND_NDIGITS = 4
 
-# 无人车场景的 GT 参考点是车头保险杠（自车坐标系 x=3.412m，见榜单文档
-# "距离计算逻辑说明·(二)"），不是相机光心。我们测的是相机到障碍物表面的
-# 直线距离，两个参考点不是同一个点——这批数据是 nuScenes（文件名带
-# CAM_FRONT），nuScenes 自车坐标系原点在后轴中心，CAM_FRONT 标定平移量
-# 大约 x≈1.70m（nuScenes 官方标定的常见值），比保险杠(x=3.412m)靠后约
-# 1.7m。保险杠比相机更靠前、离前方障碍物更近，所以相机测出来的距离会
-# 系统性地比"保险杠到障碍物"的真值大出这个偏移量——对 F1@1m 这种阈值类
-# 指标是致命的：真实距保险杠 <1m 的 case，相机测出来可能是 <1m+1.7m
-# ≈2.7m+，永远判不成 Positive，不管 ROI 多准都没用。
+# ── Outdoor 距离矫正说明 ─────────────────────────────────────────────────
 #
-# 2026-08-03 实测：两次提交（窄 ROI、宽 ROI）F1@1m 都精确等于 0.0000，
-# 换 ROI 没用，符合"参考点系统性偏移"这个假设（而不是"漏检"）。这里
-# 减去这个偏移量做近似矫正。这个 1.7m 是根据 nuScenes 公开标定数据估的
-# 一个近似值，不是这批评测数据集实测标定出来的精确值，如果矫正后 F1
-# 还是不对（比如变成 0 附近但不是 0，或者矫枉过正变太小），需要根据
-# 实际提交结果调整这个常数——先跑一次看效果，比空想更准。
+# 榜单文档对 outdoor 的定义是："从自车车头前保险杠到最近障碍物表面的
+# 水平面（x-y 平面）内的欧氏距离"——这跟单目深度模型直接给出的"沿相机
+# 光轴方向的深度（Z）"是两个不同的量：
+#
+#   1. 参考点不同：GT 量的是"保险杠"（ego 坐标系 x=3.412m），我们的
+#      深度模型天然量的是"相机光心"。这批数据是 nuScenes（文件名带
+#      CAM_FRONT），nuScenes 自车坐标系原点在后轴中心，CAM_FRONT 标定
+#      平移量常见值约 x≈1.70m，比保险杠靠后约 1.7m。
+#   2. 距离类型不同：GT 是水平面 2D 欧氏距离（沿相机光轴的纵深 Z，加上
+#      垂直于光轴的横向偏移 X，两者做欧氏距离），不是单纯的纵深 Z。
+#      这一点从榜单给的行人示例图能直接看出来：行人跟车头"纵深方向
+#      基本对齐"（lx 在 OBB 内部），真正拉开 2.498m 这个距离的是
+#      "车头偏右"这个横向分量（ly 方向大幅超出）——如果只用纵深 Z，
+#      这类case会被算成远得多的错误值,且没有任何常数能矫正回来
+#      （因为横向偏移跟纵深根本是两个独立变量，不是固定比例关系）。
+#
+# 2026-08-03/04 实测：换了两次 ROI（窄/宽）、加了纯纵深的常数矫正，
+# F1@1m 都精确等于 0.0000，没有任何变化——这跟"只是参考点没对齐"的
+# 假设不符（如果只是常数偏移，矫正后应该能看到 F1 从 0 变成非 0），
+# 更符合"有一部分case的最近障碍物是从侧面接近的，纵深值本身就是在测
+# 错误的物理量"这个假设。
+#
+# 用针孔相机模型把纵深换算成水平面 2D 距离：ROI 内最近点所在的像素列
+# 位置 + 深度值 + 相机内参，能反推出这个点相对相机光轴的横向偏移 X，
+# 再用 sqrt(X² + Z²) 近似水平面欧氏距离，比单纯用 Z 更贴近榜单定义。
+#
+# 相机内参用的是 nuScenes CAM_FRONT 公开数据里的常见标定值（原始
+# 1600x900 图像下 fx≈1266.4，主点 cx 近似取图像中心），不是这批评测
+# 数据集实测标定出来的精确值——跟 1.7m 那个偏移量一样，是能拿到的最好
+# 估计，不是确认过的精确值。运行时按实际图片宽度等比缩放 fx。
 _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M = 1.7
+_NUSCENES_CAM_FRONT_FX_AT_1600W = 1266.4  # nuScenes CAM_FRONT 典型焦距（像素，1600px 宽下）
+_NUSCENES_CAM_FRONT_REF_WIDTH = 1600
 
 
 def predict_distance(
@@ -89,15 +107,24 @@ def predict_distance(
 
     w, h = image.size
     roi = indoor_roi(w, h) if resolved_domain == "indoor" else outdoor_roi(w, h)
-    dist = nearest_obstacle_distance(depth, roi, percentile=percentile)
+    pixel = nearest_obstacle_pixel(depth, roi, percentile=percentile)
 
-    if dist != dist:  # NaN check without importing math
+    if pixel is None:
         return {"pred_distance": None, "error": "empty_roi_or_no_valid_depth"}
 
-    if resolved_domain == "outdoor":
-        # 相机光心距离 -> 近似换算成保险杠参考点距离，见模块顶部
-        # _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M 的详细说明
-        dist = max(0.0, dist - _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M)
+    depth_z, _row, col = pixel
+
+    if resolved_domain == "indoor":
+        # indoor 榜单定义就是纯纵深（"沿相机光轴方向的深度"），不做
+        # 横向换算，直接用深度值
+        dist = depth_z
+    else:
+        # outdoor：纵深 -> 保险杠参考点 + 水平面 2D 距离，见模块顶部说明
+        z_from_bumper = max(0.0, depth_z - _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M)
+        fx = _NUSCENES_CAM_FRONT_FX_AT_1600W * (w / _NUSCENES_CAM_FRONT_REF_WIDTH)
+        cx = w / 2.0
+        lateral_x = (col - cx) * depth_z / fx if fx > 0 else 0.0
+        dist = (lateral_x ** 2 + z_from_bumper ** 2) ** 0.5
 
     return {"pred_distance": round(dist, _ROUND_NDIGITS)}
 

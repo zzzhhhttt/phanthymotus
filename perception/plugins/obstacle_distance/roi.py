@@ -96,6 +96,41 @@ def nearest_obstacle_distance(
     return float(np.percentile(valid, percentile))
 
 
+def nearest_obstacle_pixel(
+    depth_map: np.ndarray,
+    roi: RoiBox,
+    percentile: float = 1.0,
+) -> tuple[float, int, int] | None:
+    """跟 nearest_obstacle_distance 一样算最近距离，但同时返回那个像素的
+    (row, col)——outdoor 场景要用这个像素在图像里的列位置，配合针孔相机
+    模型换算横向偏移（见 predict.py 里的说明：outdoor 的 GT 是水平面
+    2D 距离，不是纯深度，偏心的障碍物需要横向偏移信息才能算对）。
+
+    实现上：percentile 本身不直接对应某个具体像素（是插值出来的统计量），
+    这里退而求其次，找 ROI 内深度值离这个百分位数最近的那个像素，用它
+    的位置近似"最近点在图像里的位置"。
+
+    Returns:
+        (distance_m, row, col)，ROI 内没有有效深度时返回 None。
+    """
+    h, w = depth_map.shape[:2]
+    r0, r1 = max(0, roi.row_start), min(h, roi.row_end)
+    c0, c1 = max(0, roi.col_start), min(w, roi.col_end)
+    if r1 <= r0 or c1 <= c0:
+        return None
+
+    patch = depth_map[r0:r1, c0:c1]
+    mask = np.isfinite(patch) & (patch > 0)
+    if not np.any(mask):
+        return None
+
+    target = np.percentile(patch[mask], percentile)
+    diff = np.where(mask, np.abs(patch - target), np.inf)
+    local_row, local_col = np.unravel_index(np.argmin(diff), diff.shape)
+
+    return float(target), int(r0 + local_row), int(c0 + local_col)
+
+
 def scale_roi_to_size(canonical: RoiBox, canonical_size: tuple[int, int], target_size: tuple[int, int]) -> RoiBox:
     """把在 canonical_size=(W,H) 下定义的 ROI 等比缩放到 target_size=(W,H)。
 
