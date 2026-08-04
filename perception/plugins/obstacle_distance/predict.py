@@ -30,6 +30,24 @@ from .roi import indoor_roi, nearest_obstacle_distance, outdoor_roi
 
 _ROUND_NDIGITS = 4
 
+# 无人车场景的 GT 参考点是车头保险杠（自车坐标系 x=3.412m，见榜单文档
+# "距离计算逻辑说明·(二)"），不是相机光心。我们测的是相机到障碍物表面的
+# 直线距离，两个参考点不是同一个点——这批数据是 nuScenes（文件名带
+# CAM_FRONT），nuScenes 自车坐标系原点在后轴中心，CAM_FRONT 标定平移量
+# 大约 x≈1.70m（nuScenes 官方标定的常见值），比保险杠(x=3.412m)靠后约
+# 1.7m。保险杠比相机更靠前、离前方障碍物更近，所以相机测出来的距离会
+# 系统性地比"保险杠到障碍物"的真值大出这个偏移量——对 F1@1m 这种阈值类
+# 指标是致命的：真实距保险杠 <1m 的 case，相机测出来可能是 <1m+1.7m
+# ≈2.7m+，永远判不成 Positive，不管 ROI 多准都没用。
+#
+# 2026-08-03 实测：两次提交（窄 ROI、宽 ROI）F1@1m 都精确等于 0.0000，
+# 换 ROI 没用，符合"参考点系统性偏移"这个假设（而不是"漏检"）。这里
+# 减去这个偏移量做近似矫正。这个 1.7m 是根据 nuScenes 公开标定数据估的
+# 一个近似值，不是这批评测数据集实测标定出来的精确值，如果矫正后 F1
+# 还是不对（比如变成 0 附近但不是 0，或者矫枉过正变太小），需要根据
+# 实际提交结果调整这个常数——先跑一次看效果，比空想更准。
+_OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M = 1.7
+
 
 def predict_distance(
     image_bytes: bytes,
@@ -75,6 +93,11 @@ def predict_distance(
 
     if dist != dist:  # NaN check without importing math
         return {"pred_distance": None, "error": "empty_roi_or_no_valid_depth"}
+
+    if resolved_domain == "outdoor":
+        # 相机光心距离 -> 近似换算成保险杠参考点距离，见模块顶部
+        # _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M 的详细说明
+        dist = max(0.0, dist - _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M)
 
     return {"pred_distance": round(dist, _ROUND_NDIGITS)}
 
