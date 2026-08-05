@@ -46,14 +46,15 @@ plugins:
     classes: []         # empty = default broad set
     fps: 5
 
-  obstacle_distance:
-    enabled: true  # 独立于 ocr 之外的插件，互不影响；改这里/调这个插件的参数不会碰到 ocr 的配置
-    domain: auto     # auto（按图片格式 png=indoor/jpg=outdoor 自动判定，见榜单输入说明的等效焦距区分） | indoor | outdoor
-    percentile: 1.0  # ROI 内取第几百分位深度作为"最近障碍物距离"，对应榜单示例图里的 P1
-    device: cpu      # cpu（默认，量化模型在 GPU EP 上算子支持不稳定，CPU 单帧~150ms 仍在3秒预算内）| cuda（实验性）
-    model_dir: ""    # 留空 = 用仓库自带的 perception/models/depth_anything_v2/（已经是量化好
+  obstacle:
+    enabled: true    # 独立于 ocr 之外的插件，互不影响；改这里/调这个插件的参数不会碰到 ocr 的配置
+    provider: local  # openai | qwen | local（本地 Depth-Anything-V2 metric ONNX 推理，见 plugins/obstacle.py）
+    model_path: ""   # 留空 = 用仓库自带的 perception/models/depth_anything_v2/（已经是量化好
                       # 的 onnx 文件，~26MB/个，在榜单"模型30M以下"的文件大小限制内）；需要用
-                      # 别的路径（比如 JuiceFS 挂载）时才填
+                      # 别的路径（比如 JuiceFS 挂载）时才填，也可以用 OBSTACLE_LOCAL_MODEL_DIR
+                      # 环境变量覆盖。运行时设备/百分位数分别用 OBSTACLE_LOCAL_DEVICE（auto|cpu|cuda）
+                      # 和 OBSTACLE_LOCAL_PERCENTILE 环境变量调，不在这个 configSchema 里（provider=local
+                      # 分支的构造调用方式是固定的，见 plugins/obstacle.py 里 _build_distance_adapter）
 
   ocr:
     enabled: true
