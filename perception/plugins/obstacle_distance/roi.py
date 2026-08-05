@@ -95,7 +95,7 @@ def _backproject(rows: np.ndarray, cols: np.ndarray, depths: np.ndarray,
 
 
 def _ransac_plane(sample_points: np.ndarray, score_points: Optional[np.ndarray] = None,
-                   iterations: int = 150, inlier_thresh_m: float = 0.05, seed: int = 0):
+                   iterations: int = 50, inlier_thresh_m: float = 0.05, seed: int = 0):
     """RANSAC 拟合一个平面，返回 (normal, inlier_mask, inlier_fraction)，
     点数太少或者拟不出稳定平面时返回 None。
 
