@@ -21,6 +21,7 @@ plugins/obstacle_distance/roi.py — ROI 提取与最近障碍物距离计算。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -63,25 +64,174 @@ def outdoor_roi(width: int, height: int) -> RoiBox:
     return indoor_roi(width, height)
 
 
+def _denoise_depth_map(depth_map: np.ndarray, size: int = 5) -> np.ndarray:
+    """中值滤波去掉深度图里的孤立噪声点，再算百分位数。
+
+    单目深度模型在物体边缘/深度不连续处经常出现"孤立异常值"（个别像素
+    被预测得比周围明显更近或更远）。P1 这种低百分位数虽然比 min() 稳，
+    但 ROI 面积小的时候 1% 可能只对应一两个像素，一个噪声点就能直接
+    决定最终距离——中值滤波是标准做法，用每个像素邻域的中位数替换它，
+    直接消掉这种孤立噪声，同时基本不影响真实的物体表面（表面本身是
+    连续的一片，中值滤波后数值几乎不变）。
+
+    在整张深度图上滤波（不是只滤 ROI 内的小块），避免裁出小块之后边缘
+    因为缺少邻域上下文导致滤波效果变差。size=5 是标准选择，太小起不到
+    去噪效果，太大会把真正的物体边缘也磨掉。
+    """
+    from scipy.ndimage import median_filter
+    return median_filter(depth_map, size=size)
+
+
+def _backproject(rows: np.ndarray, cols: np.ndarray, depths: np.ndarray,
+                  fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
+    """像素 (row, col) + 深度 -> 相机坐标系下的 3D 点。
+
+    针孔相机模型，约定 X 右正、Y 下正（行方向）、Z 前正（深度方向），
+    跟图像坐标系自然对应（不需要额外的坐标轴翻转）。
+    """
+    x = (cols - cx) * depths / fx
+    y = (rows - cy) * depths / fy
+    return np.stack([x, y, depths], axis=-1)
+
+
+def _ransac_plane(sample_points: np.ndarray, score_points: Optional[np.ndarray] = None,
+                   iterations: int = 150, inlier_thresh_m: float = 0.05, seed: int = 0):
+    """RANSAC 拟合一个平面，返回 (normal, inlier_mask, inlier_fraction)，
+    点数太少或者拟不出稳定平面时返回 None。
+
+    平面方程：normal · p + d = 0（normal 已归一化）。
+
+    sample_points 是用来"抽 3 个点试拟合"的候选池，score_points 是用来
+    "数这个候选平面到底有多少内点"的评分池——两者可以不同（见
+    _ground_removal_mask：只从画面下方抽样候选平面，避免大片背景墙这种
+    更大的平面把随机采样"抢走"，但抽出候选平面之后，还是在整个 ROI 范围
+    评分/收集内点，这样即使地面延伸到画面上方，也能被同一个平面覆盖到）。
+    不传 score_points 时默认等于 sample_points。
+    """
+    n = sample_points.shape[0]
+    if n < 20:
+        return None
+    if score_points is None:
+        score_points = sample_points
+    if score_points.shape[0] < 20:
+        return None
+
+    rng = np.random.default_rng(seed)
+    best_count = 0
+    best_inliers = None
+    best_normal = None
+
+    for _ in range(iterations):
+        idx = rng.choice(n, size=3, replace=False)
+        p0, p1, p2 = sample_points[idx]
+        normal = np.cross(p1 - p0, p2 - p0)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-8:  # 三点共线，选不出平面，跳过这次采样
+            continue
+        normal = normal / norm
+        d = -np.dot(normal, p0)
+        dist = np.abs(score_points @ normal + d)
+        inliers = dist < inlier_thresh_m
+        count = int(np.sum(inliers))
+        if count > best_count:
+            best_count, best_inliers, best_normal = count, inliers, normal
+
+    if best_inliers is None:
+        return None
+    return best_normal, best_inliers, best_count / score_points.shape[0]
+
+
+def _ground_removal_mask(
+    patch: np.ndarray,
+    row_offset: int,
+    col_offset: int,
+    focal_length_px: float,
+    min_inlier_fraction: float = 0.25,
+    normal_vertical_ratio: float = 1.5,
+) -> np.ndarray:
+    """在 ROI patch 内用 RANSAC 拟合地面平面，返回"判定为地面、应剔除"的
+    布尔 mask（跟 patch 同形状）。
+
+    地面 vs 墙面怎么区分：地面法向量接近"竖直"方向（相机坐标系里的 Y
+    轴，也就是图像的行方向），墙面法向量接近"水平"方向（正对/侧对相机，
+    X/Z 分量更大）——单纯"RANSAC 拟合出一个平面就当地面剔除"是不对的，
+    ROI 里如果背景是一整面墙（榜单示例图那种场景），会被误判成"地面"
+    整个铲掉，把真实障碍物也删了。这里要求拟合出的平面法向量的 Y 分量
+    明显大于 X、Z 分量才判定为地面。
+
+    保守策略：拟合不出足够置信的平面（inlier 比例太低），或者平面看起来
+    更像墙不像地面，一律不剔除任何像素（返回全 False）——宁可漏判一点
+    地面，也不能误删真实障碍物，这个错误的代价更高。
+    """
+    valid = np.isfinite(patch) & (patch > 0)
+    ground = np.zeros_like(patch, dtype=bool)
+    if not np.any(valid):
+        return ground
+
+    rows_local, cols_local = np.nonzero(valid)
+    depths = patch[rows_local, cols_local].astype(np.float64)
+    rows_global = (rows_local + row_offset).astype(np.float64)
+    cols_global = (cols_local + col_offset).astype(np.float64)
+
+    h, w = patch.shape[:2]
+    cx = col_offset + w / 2.0  # 主点用整张图的中心估计，这里近似用 patch 中心 + 偏移
+    cy = row_offset + h / 2.0
+    points = _backproject(rows_global, cols_global, depths,
+                           focal_length_px, focal_length_px, cx, cy)
+
+    # 只从 patch 下方 40% 的行里抽 3 点候选平面（地面物理上更可能出现在
+    # 画面下方），但评分/收集内点还是用全部有效点。原因：如果 ROI 内
+    # 同时有一整面大背景墙（榜单示例图那种场景）和一小片地面，两者都是
+    # 完美平面，纯随机采样很容易被面积更大的墙"抢走"——RANSAC 会拟合出
+    # 墙这个平面，因为它的法向量不够竖直会被下面的检查正确拒绝，但也
+    # 就此错过了真正的地面，白白抽样一轮，等于没做地面剔除。限定采样
+    # 范围到画面下方，让候选平面更有机会命中地面。
+    bottom_threshold = row_offset + h * 0.6
+    bottom_mask = rows_global >= bottom_threshold
+    sample_points = points[bottom_mask] if np.count_nonzero(bottom_mask) >= 20 else points
+
+    result = _ransac_plane(sample_points, score_points=points)
+    if result is None:
+        return ground
+    normal, inliers, inlier_fraction = result
+    if inlier_fraction < min_inlier_fraction:
+        return ground
+    if abs(normal[1]) < normal_vertical_ratio * max(abs(normal[0]), abs(normal[2]), 1e-6):
+        # 法向量不够"竖直"，更像墙面而不是地面，不剔除
+        return ground
+
+    ground[rows_local[inliers], cols_local[inliers]] = True
+    return ground
+
+
 def nearest_obstacle_distance(
     depth_map: np.ndarray,
     roi: RoiBox,
     percentile: float = 1.0,
+    focal_length_px: Optional[float] = None,
 ) -> float:
     """ROI 内深度值的 P{percentile} 分位数，作为"最近障碍物表面距离"。
 
     用低百分位数（默认 P1）代替严格的 min()，是为了对单像素噪声/深度图
     个别异常低值更鲁棒——跟榜单示例图里"P1 百分位数对应的最近像素点"的
-    描述一致。
+    描述一致。滤波（见 _denoise_depth_map）在百分位数之前做，两层防护
+    叠加：中值滤波先去掉孤立噪声点，百分位数再对滤波后仍存在的分布
+    尾部更鲁棒。
 
     Args:
         depth_map: HxW，单位米，值越大表示越远。
         roi: 感兴趣区域（像素索引，含 row_start/col_start，不含 row_end/col_end）。
         percentile: 0~100，取 ROI 内深度分布的第几百分位作为最近距离。
+        focal_length_px: 传了就额外做一次 RANSAC 地面平面剔除（见
+            _ground_removal_mask），不传（默认 None）就跳过这一步，保持
+            旧行为——ROI 本身（indoor/outdoor 都用 col 1/3~2/3、row 0~5/8）
+            已经排除了大部分地面，这一步是给"ROI 内仍残留少量地面"这种
+            情况加的第二层保护，不是替代 ROI。
 
     Returns:
         最近障碍物距离（米）。ROI 内没有有效深度时返回 float('nan')。
     """
+    depth_map = _denoise_depth_map(depth_map)
     h, w = depth_map.shape[:2]
     r0, r1 = max(0, roi.row_start), min(h, roi.row_end)
     c0, c1 = max(0, roi.col_start), min(w, roi.col_end)
@@ -89,7 +239,12 @@ def nearest_obstacle_distance(
         return float("nan")
 
     patch = depth_map[r0:r1, c0:c1]
-    valid = patch[np.isfinite(patch) & (patch > 0)]
+    valid_mask = np.isfinite(patch) & (patch > 0)
+    if focal_length_px is not None and focal_length_px > 0:
+        ground = _ground_removal_mask(patch, r0, c0, focal_length_px)
+        valid_mask = valid_mask & ~ground
+
+    valid = patch[valid_mask]
     if valid.size == 0:
         return float("nan")
 
@@ -100,6 +255,7 @@ def nearest_obstacle_pixel(
     depth_map: np.ndarray,
     roi: RoiBox,
     percentile: float = 1.0,
+    focal_length_px: Optional[float] = None,
 ) -> tuple[float, int, int] | None:
     """跟 nearest_obstacle_distance 一样算最近距离，但同时返回那个像素的
     (row, col)——outdoor 场景要用这个像素在图像里的列位置，配合针孔相机
@@ -110,9 +266,16 @@ def nearest_obstacle_pixel(
     这里退而求其次，找 ROI 内深度值离这个百分位数最近的那个像素，用它
     的位置近似"最近点在图像里的位置"。
 
+    跟 nearest_obstacle_distance 一样，先做中值滤波去掉孤立噪声点（见
+    _denoise_depth_map），避免噪声点被误当成"最近像素"、连带把它的
+    列位置也带偏（这个函数返回的列位置还要参与 outdoor 的横向偏移换算，
+    位置本身不准的话，横向距离会跟着错）。focal_length_px 传了的话，
+    额外做一次地面平面剔除，说明见 nearest_obstacle_distance。
+
     Returns:
         (distance_m, row, col)，ROI 内没有有效深度时返回 None。
     """
+    depth_map = _denoise_depth_map(depth_map)
     h, w = depth_map.shape[:2]
     r0, r1 = max(0, roi.row_start), min(h, roi.row_end)
     c0, c1 = max(0, roi.col_start), min(w, roi.col_end)
@@ -123,6 +286,15 @@ def nearest_obstacle_pixel(
     mask = np.isfinite(patch) & (patch > 0)
     if not np.any(mask):
         return None
+
+    if focal_length_px is not None and focal_length_px > 0:
+        ground = _ground_removal_mask(patch, r0, c0, focal_length_px)
+        mask_after_ground = mask & ~ground
+        # 极端情况下地面剔除把 ROI 内全部有效像素都判成了地面（比如
+        # RANSAC 误判），这时候宁可退回"不剔除地面"的结果，也不要直接
+        # 判失败——一个可能包含地面污染的距离，比完全没有结果要有用。
+        if np.any(mask_after_ground):
+            mask = mask_after_ground
 
     target = np.percentile(patch[mask], percentile)
     diff = np.where(mask, np.abs(patch - target), np.inf)

@@ -133,8 +133,10 @@ RUN python3 -c "import cv2; print('system cv2 OK, version', cv2.__version__)"
 # perception/plugins/obstacle_distance/export_onnx.py，一次性开发脚本，
 # 不在这个镜像里跑），运行时只用 onnxruntime 加载执行。OCR 那段已经装过
 # onnxruntime 了，这里显式再装一次是为了这段独立、不依赖 OCR 那段以后
-# 会不会被改掉（pip 对已满足的依赖是no-op，不会重复下载）。
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime
+# 会不会被改掉（pip 对已满足的依赖是no-op，不会重复下载）。scipy 是
+# roi.py 里深度图中值滤波去噪用的（HTMSG 那段已经装过 scipy 给
+# kiss-icp 用，这里显式再装一次同样是为了不依赖别的插件的安装顺序）。
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime scipy
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work

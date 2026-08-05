@@ -6,3 +6,4 @@
 onnxruntime
 pillow
 numpy
+scipy  # roi.py 里深度图中值滤波去噪用 scipy.ndimage.median_filter

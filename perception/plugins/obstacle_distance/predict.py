@@ -66,6 +66,19 @@ _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M = 1.7
 _NUSCENES_CAM_FRONT_FX_AT_1600W = 1266.4  # nuScenes CAM_FRONT 典型焦距（像素，1600px 宽下）
 _NUSCENES_CAM_FRONT_REF_WIDTH = 1600
 
+# ── 地面平面剔除用的焦距估计 ────────────────────────────────────────────
+#
+# roi.py 的地面平面剔除（RANSAC 拟合 + 法向量校验）需要相机内参（焦距）
+# 才能把像素+深度反投影成 3D 点。outdoor 复用上面 nuScenes 的真实标定值
+# （更准），indoor 没有对应的公开标定数据，用榜单文档给的"等效焦距 29mm"
+# 按标准 35mm 等效换算公式估算：
+#     fx_pixels ≈ image_width_px × 等效焦距mm / 36mm
+# （36mm 是全画幅传感器的参考宽度，这是"35mm 等效焦距"这个概念本身的
+# 定义基准，不是额外假设）。这是能拿到的最好估计，不是这批评测数据集
+# 实测标定出来的精确值。
+_INDOOR_FOCAL_LENGTH_EQUIV_MM = 29.0
+_FULL_FRAME_SENSOR_WIDTH_MM = 36.0
+
 
 def predict_distance(
     image_bytes: bytes,
@@ -106,8 +119,19 @@ def predict_distance(
         return {"pred_distance": None, "error": f"inference_failed: {e}"}
 
     w, h = image.size
-    roi = indoor_roi(w, h) if resolved_domain == "indoor" else outdoor_roi(w, h)
-    pixel = nearest_obstacle_pixel(depth, roi, percentile=percentile)
+
+    if resolved_domain == "indoor":
+        roi = indoor_roi(w, h)
+        fx = w * _INDOOR_FOCAL_LENGTH_EQUIV_MM / _FULL_FRAME_SENSOR_WIDTH_MM
+    else:
+        roi = outdoor_roi(w, h)
+        fx = _NUSCENES_CAM_FRONT_FX_AT_1600W * (w / _NUSCENES_CAM_FRONT_REF_WIDTH)
+
+    # focal_length_px 传进去之后，nearest_obstacle_pixel 会额外做一次
+    # RANSAC 地面平面剔除（indoor/outdoor 都做——outdoor 场景 GT 同样
+    # 明确排除路面 flat.*，跟 indoor 排除地面是同一个意图），详见 roi.py
+    # 里 _ground_removal_mask 的说明
+    pixel = nearest_obstacle_pixel(depth, roi, percentile=percentile, focal_length_px=fx)
 
     if pixel is None:
         return {"pred_distance": None, "error": "empty_roi_or_no_valid_depth"}
@@ -121,7 +145,6 @@ def predict_distance(
     else:
         # outdoor：纵深 -> 保险杠参考点 + 水平面 2D 距离，见模块顶部说明
         z_from_bumper = max(0.0, depth_z - _OUTDOOR_CAMERA_TO_BUMPER_OFFSET_M)
-        fx = _NUSCENES_CAM_FRONT_FX_AT_1600W * (w / _NUSCENES_CAM_FRONT_REF_WIDTH)
         cx = w / 2.0
         lateral_x = (col - cx) * depth_z / fx if fx > 0 else 0.0
         dist = (lateral_x ** 2 + z_from_bumper ** 2) ** 0.5
