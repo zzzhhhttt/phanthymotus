@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -739,7 +739,21 @@ class LocalDistanceAdapter(DistanceAdapter):
         self._executor.shutdown(wait=False)
 
     def estimate(self, image_bytes: bytes) -> dict:
-        """返回 {"pred_distance": <float, 米>}，异常/超时一律 fallback 到常量默认值，不抛出。"""
+        """返回 {"pred_distance": <float, 米>}，异常一律 fallback 到常量默认值，不抛出。
+
+        2026-08-08：应要求暂时不再对超过 _TIMEOUT_SECONDS(2.7s) 的推理提前
+        截断返回兜底值——之前的现象是几乎每一帧都卡在这个超时上，导致看到
+        的全是 10.0 这个常量，根本看不到模型真实算出来的距离，没法判断
+        模型本身准不准。现在无论算多久，都等 _infer_once 真正跑完，把
+        真实预测值返回（异常/模型加载失败等真正的错误路径不受影响，仍然
+        走兜底，这些不是"时间"问题，没有真实值可给）。
+
+        注意：榜单本身的硬约束是 3 秒（见 README/OBSTACLE.md），这里去掉
+        超时只是为了先确认真实预测值本身对不对、模型/ROI 逻辑有没有问题；
+        等确认了预测值合理之后，仍然需要重新加回一个时间预算保护（不然
+        真实评测环境如果推理经常超过 3 秒，会直接影响榜单打分甚至判超时
+        失败），不能一直这样跑。
+        """
         if not self._sessions:
             log.error("[obstacle][local] no models loaded, returning fallback distance")
             return {"pred_distance": self._FALLBACK_DISTANCE}
@@ -747,24 +761,15 @@ class LocalDistanceAdapter(DistanceAdapter):
         t0 = time.monotonic()
         try:
             future = self._executor.submit(self._infer_once, image_bytes)
-            try:
-                result = future.result(timeout=self._TIMEOUT_SECONDS)
-            except _FutureTimeoutError:
-                # 硬超时：立即返回兜底值，不等待底层 onnxruntime 调用完成
-                # （该线程会在池子里继续跑到结束，结果被丢弃）。这是唯一能在
-                # onnxruntime.run() 本身异常慢时，仍然保证对外接口在预算内
-                # 返回结果的办法——它是一次同步 C 调用，没法从外部中途打断。
-                log.error(f"[obstacle][local] inference exceeded {self._TIMEOUT_SECONDS}s budget, "
-                          f"returning fallback distance")
-                return {"pred_distance": self._FALLBACK_DISTANCE}
+            result = future.result()  # 不传 timeout，一直等真实结果
         except Exception as e:
             log.error(f"[obstacle][local] unexpected error: {e}", exc_info=True)
             return {"pred_distance": self._FALLBACK_DISTANCE}
 
         elapsed = time.monotonic() - t0
         if elapsed > self._TIMEOUT_SECONDS:
-            log.warning(f"[obstacle][local] inference finished late ({elapsed*1000:.0f}ms, "
-                        f"budget={self._TIMEOUT_SECONDS*1000:.0f}ms)")
+            log.warning(f"[obstacle][local] inference took {elapsed*1000:.0f}ms, "
+                        f"over the {self._TIMEOUT_SECONDS*1000:.0f}ms budget (timeout not enforced right now)")
         return result
 
 
