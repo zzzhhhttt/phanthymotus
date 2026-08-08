@@ -32,9 +32,9 @@ from typing import Optional
 # 才生效——如果 main.py 先加载了 ocr/vop 等其他也用 numpy 的插件，
 # BLAS 线程池早就初始化完了，这里再设置不起作用，需要在容器启动层面设置
 # 同名环境变量才能保证生效。
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
-os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 import rclpy
@@ -634,9 +634,10 @@ class LocalDistanceAdapter(DistanceAdapter):
         # 测不出这个问题（自动探测在这台机器上刚好也表现正常），这是这次
         # 没能在本地复现、只能先按最佳实践改的地方——显式限定成一个较小的
         # 固定线程数，不管宿主机报多少核，都不会过度订阅。真实评测环境的
-        # CPU 配额未知，默认给 2（明显小于绝大多数容器配额，足够安全），
-        # 可以通过 OBSTACLE_LOCAL_INTRA_OP_THREADS 环境变量按实际配额调。
-        intra_threads = int(os.environ.get("OBSTACLE_LOCAL_INTRA_OP_THREADS", "2"))
+        # CPU 配额未知，默认给 1（最保守，先确保不会过度订阅；如果确认
+        # 配额比较宽裕，可以通过 OBSTACLE_LOCAL_INTRA_OP_THREADS 环境变量
+        # 调大）。
+        intra_threads = int(os.environ.get("OBSTACLE_LOCAL_INTRA_OP_THREADS", "1"))
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = intra_threads
         sess_options.inter_op_num_threads = 1  # 单条推理图，没有需要并行调度的独立子图

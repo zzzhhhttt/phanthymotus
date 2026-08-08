@@ -227,11 +227,13 @@ onnxruntime session 时没有传 `SessionOptions`，`intra_op_num_threads`
 **做的改动**（都是本地测不出收益、只能按最佳实践先做、需要下一次真实
 评测反馈验证的改动，跟本文档一贯的风格一致地记录下来）：
 1. `_load_models()` 现在显式传 `SessionOptions`，`intra_op_num_threads`
-   固定为 2（`OBSTACLE_LOCAL_INTRA_OP_THREADS` 环境变量可调），
+   固定为 1（`OBSTACLE_LOCAL_INTRA_OP_THREADS` 环境变量可调，2026-08-08
+   进一步从 2 收紧到 1，先按最保守的设置排除过度订阅这个可能性，确认
+   评测容器实际 CPU 配额更宽裕之后再考虑调大），
    `inter_op_num_threads=1`（模型是单条推理图，没有需要并行调度的独立
    子图），不再依赖 onnxruntime 的自动探测。
 2. 文件最顶上（`import numpy` 之前）用 `os.environ.setdefault` 把
-   `OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS` 设成 2——
+   `OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS` 同步设成 1——
    这几个必须在 numpy 第一次被 import 之前设置才有效，只有在这个进程里
    `plugins.obstacle` 是第一个 import numpy 的模块时才生效（比如
    config.yaml 只开了 `obstacle` 这一个插件的场景）；如果 `main.py`
