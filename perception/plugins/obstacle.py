@@ -605,34 +605,17 @@ class LocalDistanceAdapter(DistanceAdapter):
     # ── 模型加载 ──────────────────────────────────────────────────────────
 
     def _resolve_providers(self) -> list[str]:
-        import onnxruntime as ort
-
-        # 2026-08-08：默认值从 "auto" 改成 "cpu"。这台开发机没装 CUDA，
-        # "auto" 优先尝试 CUDA 会直接失败回退到 CPU，本地测不出问题；但真实
-        # 评测硬件（大概率是 Jetson，GPU/CPU 是统一内存）如果 CUDA 可用，
-        # "auto" 会成功建出 CUDAExecutionProvider session，这部分显存在
-        # Jetson 上跟系统内存是同一块物理内存——直接推高实际可用内存，是
-        # 反复 137 之外还没排查过的一个内存消耗点。已经不需要再纠结要不要
-        # 用 GPU 了：CPU 推理本来就在预算内（本地实测几百毫秒~1秒级），
-        # 干脆不给 CUDA 机会，明确固定用 CPU，同时也让"GPU占用"这条约束
-        # 彻底不用管。仍然可以用 OBSTACLE_LOCAL_DEVICE=cuda 显式开回来。
-        device = os.environ.get("OBSTACLE_LOCAL_DEVICE", "cpu").lower()
-        available = ort.get_available_providers()
-
-        if device == "cpu":
-            return ["CPUExecutionProvider"]
-        if device == "cuda":
-            if "CUDAExecutionProvider" in available:
-                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            log.warning("[obstacle][local] OBSTACLE_LOCAL_DEVICE=cuda but CUDAExecutionProvider "
-                        "unavailable, falling back to CPU")
-            return ["CPUExecutionProvider"]
-        # auto（需要显式设置 OBSTACLE_LOCAL_DEVICE=auto 才会走到这里，不再是
-        # 默认值）：量化模型的 ConvInteger/MatMulInteger 算子在部分 CUDA EP
-        # 版本上支持不稳定，优先尝试 CUDA，session 创建失败时在 _load_models 里整体
-        # 回退到 CPU-only provider 列表重试。
-        if "CUDAExecutionProvider" in available:
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        # 2026-08-08：之前这里还留着 "auto"/"cuda" 分支（默认已经改成
+        # cpu，但 CUDA 代码路径还在，理论上能被环境变量重新打开）。这次
+        # 真实评测日志证实了这套评测框架会同时拉起 10 个 obstacle 容器
+        # 并发跑（10 个 `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all`
+        # 的 docker run，各自独立 MCP 端口），10 个容器抢同一台宿主机的
+        # 资源——GPU 对这些容器是真实可见、可用的，不是本地这台开发机那种
+        # "反正没装CUDA所以测不出问题"的情况。既然只需要 OCR + 测距两个
+        # 模型、CPU 推理已经在预算内，就没必要留一条"理论上能触发 GPU
+        # 显存分配"的代码路径给自己找麻烦——直接把 CUDA 分支整个删掉，
+        # 不再支持 OBSTACLE_LOCAL_DEVICE=cuda/auto，永远只用 CPU，简单、
+        # 确定，不用再担心这条路径会不会被什么地方意外打开。
         return ["CPUExecutionProvider"]
 
     def _load_models(self):
@@ -674,13 +657,12 @@ class LocalDistanceAdapter(DistanceAdapter):
                 log.warning(f"[obstacle][local] model {path.name} is {size_mb:.1f}MB, "
                             f"exceeds {self._MODEL_SIZE_BUDGET_MB}MB budget")
 
-            try:
-                session = ort.InferenceSession(str(path), sess_options=sess_options, providers=providers)
-            except Exception as e:
-                log.error(f"[obstacle][local] failed to load {path} with providers={providers}: {e}; "
-                          f"retrying with CPUExecutionProvider only")
-                session = ort.InferenceSession(str(path), sess_options=sess_options,
-                                                providers=["CPUExecutionProvider"])
+            # providers 现在永远是 ["CPUExecutionProvider"]（见 _resolve_providers），
+            # 加载失败大概率是模型文件本身的问题（损坏/格式不对），不是 provider
+            # 选择的问题，不再需要"换个 provider 重试"这层——失败就让异常往上抛，
+            # 调用方（LocalDistanceAdapter.__init__ -> plugin 初始化）会看到真正的
+            # 报错，比吞掉异常继续跑一个模型没加载成功的实例更容易定位问题。
+            session = ort.InferenceSession(str(path), sess_options=sess_options, providers=providers)
 
             actual_providers = session.get_providers()
             log.info(f"[obstacle][local] loaded {domain} model: {path.name} "

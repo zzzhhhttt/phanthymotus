@@ -60,12 +60,11 @@ outdoor 定义图像空间 ROI（其真值基于 3D 标注框而非图像裁剪+
 
 - 模型只在 `LocalDistanceAdapter.__init__` 里加载一次（两个 onnxruntime
   session 常驻实例属性），不会每次 `estimate()` 重新加载。
-- Provider 优先 `CUDAExecutionProvider`，不可用时（本地实测：量化模型的
-  `ConvInteger`/`MatMulInteger` 算子在部分 CUDA EP 版本上支持不稳定，或
-  环境本身缺 CUDA 运行库）自动回退 `CPUExecutionProvider`，加载完成后
-  用 `session.get_providers()` 记录实际生效的 provider，不假设配置的
-  provider 一定生效。CPU 推理时"GPU 占用 < 10%"这条约束天然满足。
-  可用 `OBSTACLE_LOCAL_DEVICE=cpu|cuda|auto` 环境变量强制指定。
+- 2026-08-08 起固定只用 `CPUExecutionProvider`，`_resolve_providers()` 里
+  CUDA 相关代码整个删掉了，不再有 `OBSTACLE_LOCAL_DEVICE` 这个环境变量
+  （见下面对应章节的详细原因：真实评测框架会并发拉起 10 个 obstacle 容器，
+  且都带 `--runtime nvidia`，GPU 是真实可用的，没必要留一条能被打开的
+  GPU 显存分配路径）。CPU 推理时"GPU 占用 < 10%"这条约束天然满足。
 - 加载时检查模型文件大小，超过 30MB 预算会 `log.warning`（当前两个
   int8 量化模型各 ~26MB，在预算内）。
 - 本地实测（这台开发机，CPU provider）单帧端到端（含场景判定+预处理+
@@ -294,13 +293,25 @@ CUDA，"auto" 优先尝试 CUDA 总是直接失败、本地测不出问题；但
 CUDA 可用，"auto" 会成功建出 CUDA session，这部分占用会直接算在系统
 可用内存里——是这几轮反复排查 137 之外还没检查过的一个内存来源。
 
-现在默认值改成 `OBSTACLE_LOCAL_DEVICE=cpu`，不再给 CUDA 任何机会（仍然
-可以用环境变量显式改回 `cuda`/`auto`）。CPU 推理本来就在预算内（本地
+当时先把默认值改成了 `OBSTACLE_LOCAL_DEVICE=cpu`，但 CUDA 分支的代码
+还留着（理论上还能被环境变量重新打开）。CPU 推理本来就在预算内（本地
 实测几百毫秒到一点几秒，取决于线程数设置），干脆不用 GPU，也顺带彻底
 不用管"GPU 占用"这条评测约束。同一批改动里，OCR 插件（`config.yaml`
 里 `ocr.device: cpu`）本来就是显式配置成 CPU，没有这个问题，没有改动。
 `config.yaml` 里除了 `ocr`/`obstacle` 之外的插件（asr/tts/htmsg/vop）
 本来就都是 `enabled: false`，`main.py` 只按需加载，也没有额外要关的。
+
+**2026-08-08 后续更新**：这次真实评测日志证实了评测框架的运行方式——
+会同时拉起 10 个 `phanthymotus-perception-obstacle-N`（N=0~9）容器
+并发跑评测，每个都带 `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all`，
+GPU 对这些容器是真实可见、可用的（不是本地开发机那种"反正没装CUDA"的
+情况），10 个容器还共享同一台宿主机的资源。应要求把 `_resolve_providers()`
+里 CUDA 相关代码整个删掉了，不再是"默认 cpu 但留一条 cuda 分支"，而是
+硬编码只返回 `["CPUExecutionProvider"]`，`OBSTACLE_LOCAL_DEVICE` 这个
+环境变量不再存在。`_load_models()` 里原来"provider 失败就换 CPU 重试"
+那段也顺带简化掉了——`providers` 现在永远是 CPU，重试用同样的 provider
+列表没有意义，加载失败直接让异常抛出去，比吞掉异常继续跑一个模型没
+加载成功的实例更容易定位问题。
 
 ## 2026-08-08 真正找到了：ROS2 node/publisher 从来没有被 destroy 过
 
@@ -389,9 +400,11 @@ plugins:
     model_path: ""   # 留空用仓库自带 perception/models/depth_anything_v2/
 ```
 
-`provider=local` 分支的构造调用方式固定不变，运行时设备/百分位数用环境
-变量调，不走 configSchema：`OBSTACLE_LOCAL_MODEL_DIR`、
-`OBSTACLE_LOCAL_DEVICE`（`auto`|`cpu`|`cuda`）、`OBSTACLE_LOCAL_PERCENTILE`。
+`provider=local` 分支的构造调用方式固定不变，运行时参数用环境变量调，
+不走 configSchema：`OBSTACLE_LOCAL_MODEL_DIR`、`OBSTACLE_LOCAL_PERCENTILE`、
+`OBSTACLE_LOCAL_INTRA_OP_THREADS`（默认1）、`OBSTACLE_LOCAL_DEBUG_MAX_WAIT`
+（默认60秒，debug 阶段用，见上面章节）。推理设备固定 CPU，没有对应的
+环境变量（2026-08-08 起 `_resolve_providers()` 不再支持切 GPU）。
 
 ## 关于 `plugins/obstacle_distance/` 目录
 

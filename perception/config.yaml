@@ -52,9 +52,10 @@ plugins:
     model_path: ""   # 留空 = 用仓库自带的 perception/models/depth_anything_v2/（已经是量化好
                       # 的 onnx 文件，~26MB/个，在榜单"模型30M以下"的文件大小限制内）；需要用
                       # 别的路径（比如 JuiceFS 挂载）时才填，也可以用 OBSTACLE_LOCAL_MODEL_DIR
-                      # 环境变量覆盖。运行时设备/百分位数分别用 OBSTACLE_LOCAL_DEVICE（auto|cpu|cuda）
-                      # 和 OBSTACLE_LOCAL_PERCENTILE 环境变量调，不在这个 configSchema 里（provider=local
-                      # 分支的构造调用方式是固定的，见 plugins/obstacle.py 里 _build_distance_adapter）
+                      # 环境变量覆盖。百分位数用 OBSTACLE_LOCAL_PERCENTILE 环境变量调，不在这个
+                      # configSchema 里（provider=local 分支的构造调用方式是固定的，见
+                      # plugins/obstacle.py 里 _build_distance_adapter）。推理设备固定用 CPU，
+                      # 2026-08-08 起不再支持切 GPU（见 OBSTACLE.md），没有对应的环境变量了
 
   ocr:
     enabled: true
