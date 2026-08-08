@@ -335,13 +335,136 @@ def _compute_roi_bounds(height: int, width: int) -> tuple[int, int, int, int]:
     return row_start, row_end, col_start, col_end
 
 
+# ── Local (ONNX) distance estimation — 地面平面剔除 sub-logic ─────────────────
+#
+# 2026-08-08 restore：这层逻辑最早在 plugins/obstacle_distance/roi.py 里加过
+# （commit 1590518），consolidate 成单文件 plugins/obstacle.py 时（commit
+# 5bfa6c9）为了简化被去掉了，OBSTACLE.md 当时的理由是"没有 GT 数据验证过
+# 实际收益，优先级排在延迟预算之后"。现在有了真实榜单反馈：这次提交
+# outdoor RMSE=7.2102，比历史记录里 outdoor 最优的 4.4231（那一版明确
+# 是"纯深度值 + RANSAC 地面剔除都在"，见 obstacle_distance/predict.py
+# 旧注释和 commit a72a2ce）差了不少，两者路径上唯一有实质差异的就是这层
+# 地面剔除——所以这不是从零猜测，是"去掉这层之后指标变差了"这个具体证据
+# 支撑的假设，值得重新加回来验证。
+#
+# 仍然保持原来的保守设计不变：拟合不出足够置信的平面、或者平面法向量
+# 更像墙不像地面，一律不剔除任何像素，宁可漏判残留地面，也不误删真实
+# 障碍物；即使误判，也不会比"不做这层"更差（不剔除是它的退化行为）。
+#
+# 坐标系说明：obstacle.py 故意不把模型输出的 518x518 深度图 resize 回原图
+# 尺寸（这是当初 consolidate 时特意做的简化，见 _preprocess 注释），ROI/
+# 地面剔除都直接在这个固定 518x518 坐标系里算。因为是整图独立拉伸到
+# 518x518（不保持长宽比），等效焦距换算成这个固定尺寸下的像素焦距时跟
+# 原图宽度无关，可以用常量：fx_518 = 518 * (等效焦距mm / 全画幅36mm) ——
+# indoor 用榜单给的 29mm，outdoor 复用 obstacle_distance 包里已经在用的
+# nuScenes CAM_FRONT 标定值（1600px 宽下 fx≈1266.4，按比例缩到 518）。
+# 这个焦距只用来判断"哪些像素在同一个竖直平面上"，不像之前撤回的那次
+# 换算那样依赖它的精确数值（法向量校验本身是粗粒度的方向判断，焦距量级
+# 大致对就够用，不是这次真正在赌的假设）。
+def _backproject(rows: np.ndarray, cols: np.ndarray, depths: np.ndarray,
+                  fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
+    """像素 (row, col) + 深度 -> 相机坐标系下的 3D 点（针孔相机模型，X 右正、Y 下正、Z 前正）。"""
+    x = (cols - cx) * depths / fx
+    y = (rows - cy) * depths / fy
+    return np.stack([x, y, depths], axis=-1)
+
+
+def _ransac_plane(sample_points: np.ndarray, score_points: Optional[np.ndarray] = None,
+                   iterations: int = 50, inlier_thresh_m: float = 0.05, seed: int = 0):
+    """RANSAC 拟合一个平面，返回 (normal, inlier_mask, inlier_fraction)；点数不够/拟不出稳定
+    平面时返回 None。iterations=50 是 commit a72a2ce 里为满足延迟预算从 150 调下来的值，沿用。
+    """
+    n = sample_points.shape[0]
+    if n < 20:
+        return None
+    if score_points is None:
+        score_points = sample_points
+    if score_points.shape[0] < 20:
+        return None
+
+    rng = np.random.default_rng(seed)
+    best_count = 0
+    best_inliers = None
+    best_normal = None
+
+    for _ in range(iterations):
+        idx = rng.choice(n, size=3, replace=False)
+        p0, p1, p2 = sample_points[idx]
+        normal = np.cross(p1 - p0, p2 - p0)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-8:  # 三点共线，拟不出平面，跳过这次采样
+            continue
+        normal = normal / norm
+        d = -np.dot(normal, p0)
+        dist = np.abs(score_points @ normal + d)
+        inliers = dist < inlier_thresh_m
+        count = int(np.sum(inliers))
+        if count > best_count:
+            best_count, best_inliers, best_normal = count, inliers, normal
+
+    if best_inliers is None:
+        return None
+    return best_normal, best_inliers, best_count / score_points.shape[0]
+
+
+def _ground_removal_mask(
+    patch: np.ndarray,
+    row_offset: int,
+    col_offset: int,
+    focal_length_px: float,
+    min_inlier_fraction: float = 0.25,
+    normal_vertical_ratio: float = 1.5,
+) -> np.ndarray:
+    """在 ROI patch（已经过中值滤波）内用 RANSAC 拟合地面平面，返回"判定为地面、应剔除"的
+    布尔 mask（跟 patch 同形状）。
+
+    地面 vs 墙面：地面法向量接近"竖直"（Y 轴/图像行方向），墙面法向量接近"水平"（正对/侧对
+    镜头，X/Z 分量更大）——ROI 里如果背景是一整面墙，会被误判成地面整个铲掉，把真实障碍物
+    也删了，所以必须要求法向量 Y 分量明显大于 X、Z 分量才判定为地面。
+    """
+    valid = np.isfinite(patch) & (patch > 0)
+    ground = np.zeros_like(patch, dtype=bool)
+    if not np.any(valid):
+        return ground
+
+    rows_local, cols_local = np.nonzero(valid)
+    depths = patch[rows_local, cols_local].astype(np.float64)
+    rows_global = (rows_local + row_offset).astype(np.float64)
+    cols_global = (cols_local + col_offset).astype(np.float64)
+
+    h, w = patch.shape[:2]
+    cx = col_offset + w / 2.0
+    cy = row_offset + h / 2.0
+    points = _backproject(rows_global, cols_global, depths,
+                           focal_length_px, focal_length_px, cx, cy)
+
+    # 候选平面只从 patch 下方 40% 抽样（地面物理上更可能出现在画面下方），避免大片背景墙
+    # 把随机采样"抢走"；收集内点/评分仍用整个 patch，这样即使地面延伸到画面上方也能覆盖到。
+    bottom_threshold = row_offset + h * 0.6
+    bottom_mask = rows_global >= bottom_threshold
+    sample_points = points[bottom_mask] if np.count_nonzero(bottom_mask) >= 20 else points
+
+    result = _ransac_plane(sample_points, score_points=points)
+    if result is None:
+        return ground
+    normal, inliers, inlier_fraction = result
+    if inlier_fraction < min_inlier_fraction:
+        return ground
+    if abs(normal[1]) < normal_vertical_ratio * max(abs(normal[0]), abs(normal[2]), 1e-6):
+        return ground  # 更像墙不像地面，不剔除
+
+    ground[rows_local[inliers], cols_local[inliers]] = True
+    return ground
+
+
 # ── Local (ONNX) distance estimation — 稳健取值 sub-logic ─────────────────────
 #
 # 不直接取 ROI 内的 min()：单目深度模型在物体边缘/深度不连续处容易出现
 # 孤立噪声像素，min() 对这类噪声极其敏感，一个坏点就能把整帧的距离读数
 # 拉飞。先做中值滤波去掉孤立噪声像素（对真实物体表面这种连续区域几乎
 # 没有副作用），再取 P1 分位数（而不是 P0=min）作为"最近障碍物距离"，
-# 对滤波后仍存在的分布尾部更鲁棒。
+# 对滤波后仍存在的分布尾部更鲁棒。滤波之后、取分位数之前再做一次地面
+# 平面剔除（见上面 _ground_removal_mask），两层防护叠加。
 #
 # 曾经尝试过把单一 P1 点值换成 [P1, P1+4] 百分位区间的均值，指望进一步
 # 压制个别残留像素的影响——但自己写了个合成测试验证后发现这个方向是
@@ -350,8 +473,17 @@ def _compute_roi_bounds(height: int, width: int) -> tuple[int, int, int, int]:
 # 被拉回"远"，反而丢失了纯 P1 点估计能正确检出的案例。换句话说，区间
 # 均值不是"单调更保守"，它在这个尺寸区间上是净负向的——没有 GT 数据也
 # 能用合成数据证伪，所以没有采用，退回原始单点百分位数。
-def _robust_nearest_distance(depth_roi: np.ndarray, percentile: float = 1.0) -> Optional[float]:
+def _robust_nearest_distance(
+    depth_roi: np.ndarray,
+    percentile: float = 1.0,
+    row_offset: int = 0,
+    col_offset: int = 0,
+    focal_length_px: Optional[float] = None,
+) -> Optional[float]:
     """输入 ROI 内的深度值（2D array，单位米），返回稳健的最近距离估计。
+
+    row_offset/col_offset/focal_length_px 传了才会做地面剔除（见
+    _ground_removal_mask）；不传就跳过，保持只做中值滤波+分位数的旧行为。
 
     ROI 为空、或滤波后没有任何有限正值时返回 None（由调用方决定 fallback）。
     """
@@ -366,7 +498,16 @@ def _robust_nearest_distance(depth_roi: np.ndarray, percentile: float = 1.0) -> 
         log.warning("[obstacle][local] scipy not available, skipping median-filter denoise")
         filtered = depth_roi
 
-    valid = filtered[np.isfinite(filtered) & (filtered > 0)]
+    valid_mask = np.isfinite(filtered) & (filtered > 0)
+    if focal_length_px is not None and focal_length_px > 0:
+        ground = _ground_removal_mask(filtered, row_offset, col_offset, focal_length_px)
+        mask_after_ground = valid_mask & ~ground
+        # 极端情况下地面剔除把 ROI 内全部有效像素都判成了地面（比如 RANSAC 误判）：宁可
+        # 返回一个可能含地面污染的距离，也不要直接判失败退回 fallback 常量，信息量更大。
+        if np.any(mask_after_ground):
+            valid_mask = mask_after_ground
+
+    valid = filtered[valid_mask]
     if valid.size == 0:
         return None
 
@@ -390,6 +531,16 @@ class LocalDistanceAdapter(DistanceAdapter):
         "outdoor": "depth_anything_v2_metric_outdoor_vits_int8.onnx",
     }
     _MODEL_SIZE_BUDGET_MB = 30.0
+
+    # 地面剔除（见 _ground_removal_mask）用的等效像素焦距，算在固定 518x518
+    # 坐标系下（原图整体拉伸到 518x518，等效焦距换算跟原图宽度无关，见上面
+    # "地面平面剔除 sub-logic" 注释）：
+    #   indoor  = 518 * 29mm(榜单给定等效焦距) / 36mm(全画幅基准宽度)
+    #   outdoor = nuScenes CAM_FRONT 标定 fx≈1266.4（1600px 宽下）按比例缩到 518
+    _FOCAL_PX_AT_INPUT_SIZE = {
+        "indoor": 518.0 * 29.0 / 36.0,
+        "outdoor": 1266.4 * 518.0 / 1600.0,
+    }
 
     _FALLBACK_DISTANCE = 10.0
     # 单帧总处理时间硬性预算（场景判别 + 预处理 + 推理 + ROI/后处理），
@@ -526,7 +677,11 @@ class LocalDistanceAdapter(DistanceAdapter):
         row_start, row_end, col_start, col_end = _compute_roi_bounds(*depth.shape)
         roi = depth[row_start:row_end, col_start:col_end]
 
-        dist = _robust_nearest_distance(roi, percentile=self._percentile)
+        dist = _robust_nearest_distance(
+            roi, percentile=self._percentile,
+            row_offset=row_start, col_offset=col_start,
+            focal_length_px=self._FOCAL_PX_AT_INPUT_SIZE.get(domain),
+        )
         if dist is None:
             log.warning(f"[obstacle][local] empty ROI or no valid depth pixels (domain={domain}), "
                         f"falling back to default distance")
