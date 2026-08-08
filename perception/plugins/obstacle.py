@@ -1006,10 +1006,23 @@ class ObstacleDistancePlugin:
             return self._nodes[node_key].start()
 
         elif action == "stop":
+            # 2026-08-08：node.stop() 只 destroy 了 subscription，publisher
+            # 和整个 rclpy Node（连带它在 DDS 里的 participant/发现数据）
+            # 一直没有显式释放过——之前以为 Python 引用计数/GC 会兜底，但
+            # rclpy 的资源绑定在 rmw 层，必须显式调用 destroy_node() 才会
+            # 真正释放，光靠 del 掉 self._nodes 里的引用不会。这个评测
+            # 框架的调用方式是每个 case 都 start 一个新 node、stop 时都会
+            # 走到这个分支删掉——也就是说之前每个 case 都在泄漏一份
+            # node+publisher 级别的 DDS 资源，只是量比模型/线程泄漏小，
+            # 攒了大概 4~5 个 case 才达到会被 OOM 杀掉的量级，容易被误认为
+            # "推理本身很慢/卡住"。这正是最早 plugin.py 注释里提过的
+            # "重复创建销毁 ROS2 资源导致内存上涨"那类问题，一直没有真的
+            # 补上这一半。
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
                 result = node.stop()
                 self._executor.remove_node(node)
+                node.destroy_node()
                 del self._nodes[instance_id]
                 return result
             elif not instance_id and self._nodes:
@@ -1018,6 +1031,7 @@ class ObstacleDistancePlugin:
                     node = self._nodes[key]
                     node.stop()
                     self._executor.remove_node(node)
+                    node.destroy_node()
                     del self._nodes[key]
                     results.append(key)
                 return {"state": "idle", "stopped_instances": results}
@@ -1031,6 +1045,7 @@ class ObstacleDistancePlugin:
                     node = self._nodes[instance_id]
                     node.stop()
                     self._executor.remove_node(node)
+                    node.destroy_node()  # 同 action=stop，见上面注释，这里同样会丢弃这个 node
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id, "config": cfg}
             else:

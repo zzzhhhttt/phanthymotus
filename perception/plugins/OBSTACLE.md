@@ -302,6 +302,47 @@ CUDA 可用，"auto" 会成功建出 CUDA session，这部分占用会直接算�
 `config.yaml` 里除了 `ocr`/`obstacle` 之外的插件（asr/tts/htmsg/vop）
 本来就都是 `enabled: false`，`main.py` 只按需加载，也没有额外要关的。
 
+## 2026-08-08 真正找到了：ROS2 node/publisher 从来没有被 destroy 过
+
+上面几轮改动（config 泄漏、线程过度订阅、CUDA 显存、去掉超时）推上去
+之后，这次评测终于连续拿到了 4 个真实预测值（1.2853 / 9.0671 / 6.0394 /
+1.8124），每次都在放宽后的等待上限内正常返回（17~21s），第 5 个 case
+才异常退出——不是卡死在某一次推理里，是**成功跑完几个 case 之后才崩**，
+典型的"每个 case 攒一点、攒够了才炸"的内存泄漏特征，而不是"推理一直
+在等"。
+
+翻代码找到了真正的资源泄漏点，之前一直没查到这里：`_ObstacleNode.stop()`
+只 `destroy_subscription()` 了订阅，`self._pub`（`__init__` 里创建的
+publisher）和整个 `Node` 本身**从来没有显式 destroy 过**；
+`ObstacleDistancePlugin.dispatch()` 的 `action=stop`/`action=config`
+分支也只是 `self._executor.remove_node(node)` + `del self._nodes[key]`，
+只是把 Python 层的引用丢掉、把 node 从 executor 的 spin 列表里摘掉，
+但 node 在 rmw/DDS 层绑定的资源（participant、还活着的 publisher、
+发现数据等）不会因为 Python 引用计数归零就自动释放——rclpy 明确要求
+显式调用 `destroy_node()` 才会真正释放这些。
+
+这个评测框架的调用方式是**每个 case 都 start 一个新 node、case 结束
+都 stop 掉**（`start()` 里 `if node_key not in self._nodes` 这个复用
+判断在这套调用模式下从来没有真正生效过，因为 stop 每次都会把 node 从
+`self._nodes` 里删掉，下一次 start 必然重新建一个）——也就是说改之前
+每个 case 都在泄漏一份 node+publisher 级别的 DDS 资源，只是单份泄漏量
+比之前修的模型/线程泄漏小得多，攒够 4~5 个 case 的量级才会被 OOM 杀掉，
+表现上很容易被误判成"推理慢/卡住"（这次能明确排除是因为这次终于看到了
+真实预测值、且每次都在预算内完成）。这也是最早 `plugin.py`（consolidate
+前的旧包）注释里就点名过的"重复创建销毁 ROS2 资源导致内存上涨"那类
+问题——之前几轮只修了"重复加载模型"这一半（config 泄漏那次），没有
+补上"重复创建销毁 node"这一半，这次补上。
+
+**改动**：`dispatch()` 里 `action=stop`（两个分支）和 `action=config`
+（instance_id 分支）在 `self._executor.remove_node(node)` 之后，都加了
+一次 `node.destroy_node()`，让 node 真正被丢弃前完整释放它的 publisher
+和 DDS 层资源。
+
+**这次没能在本地验证**：`_ObstacleNode` 继承的是真正的 `rclpy.node.Node`，
+这台开发机没装 rclpy（`test_obstacle.py` 为了绕开这个专门 stub 了一版
+`Node = object`），`destroy_node()` 这类真正的 ROS2 生命周期行为没法在
+本地跑起来验证，只做了语法检查，效果需要下一次真实评测确认。
+
 ## 已知局限（诚实说明近似之处）
 
 - outdoor 场景直接用 ROI 内深度分位数近似"最近障碍物距离"，没有做
