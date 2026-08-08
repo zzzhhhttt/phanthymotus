@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -559,8 +559,19 @@ class LocalDistanceAdapter(DistanceAdapter):
 
     _FALLBACK_DISTANCE = 10.0
     # 单帧总处理时间硬性预算（场景判别 + 预处理 + 推理 + ROI/后处理），
-    # 留出安全边际给 ROS2 序列化/发布开销，硬约束是 3 秒。
+    # 留出安全边际给 ROS2 序列化/发布开销，硬约束是 3 秒。榜单提交前需要
+    # 重新启用这个预算（当前 estimate() 暂时不强制它，见下面
+    # _DEBUG_MAX_WAIT_SECONDS 和 estimate() 里的说明）。
     _TIMEOUT_SECONDS = 2.7
+    # 2026-08-08：debug 阶段先确认真实预测值本身对不对，estimate() 暂时不
+    # 按 _TIMEOUT_SECONDS 这么紧的预算截断——但完全不设上限会导致
+    # _ObstacleNode.stop() 里等 worker 线程退出的 join(timeout=3.0) 等不到
+    # 线程真正结束，每个 case 都留下一个还在跑的"僵尸"推理线程，几个 case
+    # 下来越堆越多，是这次 debug 过程中观察到的新一轮 137 的根源。这里给
+    # 一个宽松但仍然有限的等待上限（60s，比历史记录里最差的约 40s 留了
+    # 余量），既能让绝大多数真实推理跑完拿到真实值，又能保证 worker 线程
+    # 最终一定会退出，不会无限堆积。
+    _DEBUG_MAX_WAIT_SECONDS = float(os.environ.get("OBSTACLE_LOCAL_DEBUG_MAX_WAIT", "60"))
     _DEFAULT_PERCENTILE = 1.0
 
     def __init__(self, model_path: Optional[str] = None):
@@ -596,7 +607,16 @@ class LocalDistanceAdapter(DistanceAdapter):
     def _resolve_providers(self) -> list[str]:
         import onnxruntime as ort
 
-        device = os.environ.get("OBSTACLE_LOCAL_DEVICE", "auto").lower()
+        # 2026-08-08：默认值从 "auto" 改成 "cpu"。这台开发机没装 CUDA，
+        # "auto" 优先尝试 CUDA 会直接失败回退到 CPU，本地测不出问题；但真实
+        # 评测硬件（大概率是 Jetson，GPU/CPU 是统一内存）如果 CUDA 可用，
+        # "auto" 会成功建出 CUDAExecutionProvider session，这部分显存在
+        # Jetson 上跟系统内存是同一块物理内存——直接推高实际可用内存，是
+        # 反复 137 之外还没排查过的一个内存消耗点。已经不需要再纠结要不要
+        # 用 GPU 了：CPU 推理本来就在预算内（本地实测几百毫秒~1秒级），
+        # 干脆不给 CUDA 机会，明确固定用 CPU，同时也让"GPU占用"这条约束
+        # 彻底不用管。仍然可以用 OBSTACLE_LOCAL_DEVICE=cuda 显式开回来。
+        device = os.environ.get("OBSTACLE_LOCAL_DEVICE", "cpu").lower()
         available = ort.get_available_providers()
 
         if device == "cpu":
@@ -607,8 +627,9 @@ class LocalDistanceAdapter(DistanceAdapter):
             log.warning("[obstacle][local] OBSTACLE_LOCAL_DEVICE=cuda but CUDAExecutionProvider "
                         "unavailable, falling back to CPU")
             return ["CPUExecutionProvider"]
-        # auto: 量化模型的 ConvInteger/MatMulInteger 算子在部分 CUDA EP 版本上
-        # 支持不稳定，优先尝试 CUDA，session 创建失败时在 _load_models 里整体
+        # auto（需要显式设置 OBSTACLE_LOCAL_DEVICE=auto 才会走到这里，不再是
+        # 默认值）：量化模型的 ConvInteger/MatMulInteger 算子在部分 CUDA EP
+        # 版本上支持不稳定，优先尝试 CUDA，session 创建失败时在 _load_models 里整体
         # 回退到 CPU-only provider 列表重试。
         if "CUDAExecutionProvider" in available:
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -741,18 +762,22 @@ class LocalDistanceAdapter(DistanceAdapter):
     def estimate(self, image_bytes: bytes) -> dict:
         """返回 {"pred_distance": <float, 米>}，异常一律 fallback 到常量默认值，不抛出。
 
-        2026-08-08：应要求暂时不再对超过 _TIMEOUT_SECONDS(2.7s) 的推理提前
-        截断返回兜底值——之前的现象是几乎每一帧都卡在这个超时上，导致看到
-        的全是 10.0 这个常量，根本看不到模型真实算出来的距离，没法判断
-        模型本身准不准。现在无论算多久，都等 _infer_once 真正跑完，把
-        真实预测值返回（异常/模型加载失败等真正的错误路径不受影响，仍然
-        走兜底，这些不是"时间"问题，没有真实值可给）。
+        2026-08-08：应要求先不按 _TIMEOUT_SECONDS(2.7s) 这么紧的预算截断——
+        之前几乎每一帧都卡在这个超时上，导致看到的全是 10.0 这个常量，
+        根本看不到模型真实算出来的距离，没法判断模型本身准不准。但完全不
+        设上限试了一版之后，观察到新的问题：_ObstacleNode.stop() 里等
+        worker 线程退出只给 3 秒（join(timeout=3.0)），如果一帧真的算很久，
+        3 秒等不到线程结束，stop() 会直接放弃、把 node 标记删掉，但那个
+        worker 线程其实还在后台跑，变成"僵尸"——下一个 case 再起一个新的
+        worker，几个 case 下来越堆越多，是新一轮 137 的根源。所以这里改成
+        一个宽松但仍然有限的等待上限（_DEBUG_MAX_WAIT_SECONDS，默认60s，
+        比历史记录里最差的约40s留了余量）：绝大多数情况下还是能等到真实
+        推理结果，同时保证 worker 线程最终一定会退出，不会无限堆积。
 
-        注意：榜单本身的硬约束是 3 秒（见 README/OBSTACLE.md），这里去掉
-        超时只是为了先确认真实预测值本身对不对、模型/ROI 逻辑有没有问题；
-        等确认了预测值合理之后，仍然需要重新加回一个时间预算保护（不然
-        真实评测环境如果推理经常超过 3 秒，会直接影响榜单打分甚至判超时
-        失败），不能一直这样跑。
+        注意：榜单本身的硬约束是 3 秒（见 README/OBSTACLE.md），这里放宽到
+        60s 只是为了先确认真实预测值本身对不对、模型/ROI 逻辑有没有问题；
+        等确认了预测值合理之后，仍然需要重新收紧到真正的预算内，不能一直
+        这样跑。
         """
         if not self._sessions:
             log.error("[obstacle][local] no models loaded, returning fallback distance")
@@ -761,7 +786,12 @@ class LocalDistanceAdapter(DistanceAdapter):
         t0 = time.monotonic()
         try:
             future = self._executor.submit(self._infer_once, image_bytes)
-            result = future.result()  # 不传 timeout，一直等真实结果
+            try:
+                result = future.result(timeout=self._DEBUG_MAX_WAIT_SECONDS)
+            except _FutureTimeoutError:
+                log.error(f"[obstacle][local] inference exceeded debug ceiling "
+                          f"{self._DEBUG_MAX_WAIT_SECONDS}s, returning fallback distance")
+                return {"pred_distance": self._FALLBACK_DISTANCE}
         except Exception as e:
             log.error(f"[obstacle][local] unexpected error: {e}", exc_info=True)
             return {"pred_distance": self._FALLBACK_DISTANCE}
@@ -769,7 +799,8 @@ class LocalDistanceAdapter(DistanceAdapter):
         elapsed = time.monotonic() - t0
         if elapsed > self._TIMEOUT_SECONDS:
             log.warning(f"[obstacle][local] inference took {elapsed*1000:.0f}ms, "
-                        f"over the {self._TIMEOUT_SECONDS*1000:.0f}ms budget (timeout not enforced right now)")
+                        f"over the real {self._TIMEOUT_SECONDS*1000:.0f}ms budget "
+                        f"(debug ceiling is {self._DEBUG_MAX_WAIT_SECONDS}s)")
         return result
 
 
@@ -836,7 +867,20 @@ class _ObstacleNode(Node):
             self._sub = None
         self._stop_event.set()
         if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=3.0)
+            # _inference_worker 的循环只在每次 estimate() 调用返回之后才会
+            # 检查 _stop_event，所以这里的 join 超时必须不小于 adapter 自己
+            # 那次调用可能等待的上限（LocalDistanceAdapter._DEBUG_MAX_WAIT_SECONDS，
+            # 2026-08-08 加的调试用宽松等待），否则一旦真赶上 worker 正卡在一次
+            # 慢推理里，3 秒等不到线程真正退出，stop() 会直接放弃、把 node
+            # 标记删掉，但线程还在后台继续跑——变成"僵尸"线程，下个 case 再起
+            # 一个新的，几个 case 下来越堆越多，是这次 debug 过程里新一轮 137
+            # 的根源。其他 adapter 类型（openai/qwen）没有这个属性，getattr
+            # 兜底成一个小值，行为跟改之前一样。
+            join_timeout = getattr(self._adapter, "_DEBUG_MAX_WAIT_SECONDS", 3.0) + 3.0
+            self._worker.join(timeout=join_timeout)
+            if self._worker.is_alive():
+                log.error(f"[obstacle] worker thread for {self._input_topic} did not exit within "
+                          f"{join_timeout}s, leaking in background (should be rare)")
         self._worker = None
         self.state = "idle"
         log.info(f"[obstacle] stopped: {self._input_topic}")
