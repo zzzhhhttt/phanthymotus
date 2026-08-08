@@ -691,6 +691,14 @@ class LocalDistanceAdapter(DistanceAdapter):
 
     # ── 对外接口 ──────────────────────────────────────────────────────────
 
+    def close(self):
+        """释放线程池。onnxruntime session 没有显式 close API，靠正常的 Python
+        引用计数回收——但 ThreadPoolExecutor 的 worker 线程不会自己退出，config
+        每次重建 adapter 时如果不对旧实例调用这个，旧线程池会一直挂在后台，见
+        ObstacleDistancePlugin.dispatch() 里 action=config 分支的调用点。
+        """
+        self._executor.shutdown(wait=False)
+
     def estimate(self, image_bytes: bytes) -> dict:
         """返回 {"pred_distance": <float, 米>}，异常/超时一律 fallback 到常量默认值，不抛出。"""
         if not self._sessions:
@@ -938,22 +946,37 @@ class ObstacleDistancePlugin:
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id, "config": cfg}
             else:
-                if "provider" in cfg:
-                    self._provider = cfg["provider"]
-                if "model" in cfg:
-                    self._model = cfg["model"]
-                if "key" in cfg:
-                    self._key = cfg["key"]
-                if "url" in cfg:
-                    self._url = cfg["url"]
-                # Rebuild global adapter
-                self._adapter = _build_distance_adapter({
-                    "provider": self._provider,
-                    "url": self._url,
-                    "key": self._key,
-                    "model": self._model,
-                    "model_path": self._model_path,
-                })
+                # 2026-08-08：评测框架每个 case 都会调一次 action=config（见本次
+                # OOM 排查），如果这里无条件重建 adapter，provider=local 时每个
+                # case 都会重新加载两个 onnx 模型、new 一个 onnxruntime session +
+                # 一个 ThreadPoolExecutor，旧的那份既不 shutdown 线程池也不释放
+                # session，跑几十个 case 内存就堆起来了——这正是
+                # plugins/obstacle_distance/plugin.py 当初专门写注释警告过的坑
+                # （OCR 插件历史上因为同样的模式被 OOM 杀掉），consolidate 成
+                # 单文件时这层"只有真的变化才重建"的判断丢掉了，这里加回来。
+                new_provider = cfg.get("provider", self._provider)
+                new_url = cfg.get("url", self._url)
+                new_key = cfg.get("key", self._key)
+                new_model = cfg.get("model", self._model)
+                changed = (new_provider, new_url, new_key, new_model) != \
+                          (self._provider, self._url, self._key, self._model)
+
+                self._provider, self._url, self._key, self._model = new_provider, new_url, new_key, new_model
+
+                if changed:
+                    old_adapter = self._adapter
+                    self._adapter = _build_distance_adapter({
+                        "provider": self._provider,
+                        "url": self._url,
+                        "key": self._key,
+                        "model": self._model,
+                        "model_path": self._model_path,
+                    })
+                    if isinstance(old_adapter, LocalDistanceAdapter):
+                        old_adapter.close()
+                    log.info(f"[obstacle] config changed, adapter rebuilt: provider={self._provider}")
+                else:
+                    log.debug("[obstacle] config unchanged, skip adapter rebuild")
                 return {"status": "configured", "config": cfg}
 
         return None

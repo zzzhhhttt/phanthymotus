@@ -164,6 +164,40 @@ a72a2ce 调过的 50 次）重新加回 `plugins/obstacle.py`，接到
 而不是召回率差，需要 FN 或者 case 级别明细才能分清楚，不能再靠"看起来
 合理"的推理继续调，这一点跟本文档一贯的原则一致。
 
+## 2026-08-08 修复：action=config 每个 case 都无条件重建 adapter，OOM 根因
+
+提交上面这版改动后，第一次真实评测在 case 2/36（container
+`phanthymotus-perception-obstacle-1`）就以退出码 137 异常终止。排查
+发现是一个跟这次地面剔除改动无关、更早就存在的 bug：`dispatch()` 里
+`action=config` 且不带 `instance_id` 的分支（全局 config），每次被
+调用都无条件执行 `self._adapter = _build_distance_adapter(...)`——
+`provider=local` 时这意味着每次都重新加载两个 onnx 模型、new 一个
+onnxruntime session、new 一个 `ThreadPoolExecutor`，而旧的 adapter
+（旧 session、旧线程池）既没有 shutdown 也没有显式释放，直接被引用
+覆盖丢弃。评测日志显示 `MCP 配置障碍物检测(tool=obstacle)` 这行每个
+case 都打一次，说明评测框架确实是每个 case 都调一次 `action=config`——
+这正是 `plugins/obstacle_distance/plugin.py`（consolidate 前的旧包）
+docstring 里专门写注释警告过的坑："config 只有内容真的变化时才重建…
+避免评测框架每个 case 都调一次 start/stop/config 时，重复加载模型、
+重复创建销毁 ROS2 资源导致的内存上涨（OCR 插件曾经因为这个被 OOM
+杀掉）"——旧包里这层"只有真的变化才重建"的判断，consolidate 成单文件
+`plugins/obstacle.py`（commit 5bfa6c9）时丢掉了。
+
+修复：`action=config` 全局分支现在会对比 `provider/url/key/model` 跟
+上一次的值，完全没变就跳过重建，直接复用现有 `self._adapter`；真的
+需要重建时，对旧 adapter（如果是 `LocalDistanceAdapter`）调用新加的
+`close()` 方法 shutdown 掉它的 `ThreadPoolExecutor`，避免线程池累积。
+
+验证：本地起一个 `ObstacleDistancePlugin`（provider=local），连续调用
+5 次 `action=config`（内容跟上次完全一样）——修改前每次都应该触发一次
+模型重新加载（onnxruntime session 创建日志/CUDA fallback 警告各出现
+5 次），修改后 5 次连续调用 `self._adapter` 对象 id 完全不变，只有在
+后面真的换了 `model` 参数时才重建了一次，跟预期一致。
+
+这次没有触碰 `instance_id` 场景（带 instance_id 的 config 只是记录
+per-instance 配置 + 拆掉对应节点，不涉及重建全局 adapter，本来就没有
+这个问题）。
+
 ## 已知局限（诚实说明近似之处）
 
 - outdoor 场景直接用 ROI 内深度分位数近似"最近障碍物距离"，没有做
