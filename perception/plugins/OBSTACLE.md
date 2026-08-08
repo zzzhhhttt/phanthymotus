@@ -198,6 +198,58 @@ docstring 里专门写注释警告过的坑："config 只有内容真的变化�
 per-instance 配置 + 拆掉对应节点，不涉及重建全局 adapter，本来就没有
 这个问题）。
 
+## 2026-08-08 又一次真实评测：config 泄漏修好了（撑到 case 5），但每个
+## case 都是 pred_distance=10.0（超时兜底）+ 最终仍然 137
+
+推上一条修复后重新提交，这次撑到了 case 5/36 才异常退出（比之前 case 2
+好，说明 config 重建那个泄漏确实是真问题、也确实修对了方向），但案例
+级别日志显示前 4 个全部完成的 case，`pred_distance` 无一例外都是
+`10.0`——也就是 `LocalDistanceAdapter.estimate()` 每一帧都撞到了内部
+2.7s 硬超时，从来没有真正跑完过一次推理、返回过真实距离。这解释了
+本文档最早（2026-08-05）就记录过、当时没查出根因的那个谜团："本地
+1600x900 合成数据实测中值滤波+RANSAC 全部加起来也就 0.6 秒左右，跟
+真实环境 20-40 秒的差距解释不了"——这次的 case 全是 outdoor（jpg，
+nuScenes CAM_FRONT），跟历史记录里 outdoor(40s) 比 indoor(20s) 更慢
+这个方向也对得上。
+
+**怀疑的根因，跟这几个函数本身的计算量无关**：`_load_models()` 建
+onnxruntime session 时没有传 `SessionOptions`，`intra_op_num_threads`
+默认是 0（= onnxruntime 自动探测）。自动探测在容器里是已知的坑——按
+宿主机能看到的 CPU 核数建线程池（这台开发机 36 核，探测结果拿这台机器
+测不出问题），不一定感知 Docker/K8s 的 cgroup CPU 配额。真实评测容器
+如果配额远小于宿主机核数（大概率），onnxruntime 会建一个远超实际配额
+的线程池，线程互相抢占被 CFS 节流，实测这类问题能把推理拖慢一个数量级
+以上，量级上能解释 20-40s；线程本身的栈内存/调度开销同时推高内存占用，
+也可能是反复 OOM(137) 的另一个诱因（不止是上一节修的那个 config 泄漏，
+两个问题可能都在起作用）。numpy/scipy 底层的 BLAS 线程池（OpenBLAS/MKL）
+是同一类问题的另一半，会影响中值滤波和这次加回来的 RANSAC 矩阵运算。
+
+**做的改动**（都是本地测不出收益、只能按最佳实践先做、需要下一次真实
+评测反馈验证的改动，跟本文档一贯的风格一致地记录下来）：
+1. `_load_models()` 现在显式传 `SessionOptions`，`intra_op_num_threads`
+   固定为 2（`OBSTACLE_LOCAL_INTRA_OP_THREADS` 环境变量可调），
+   `inter_op_num_threads=1`（模型是单条推理图，没有需要并行调度的独立
+   子图），不再依赖 onnxruntime 的自动探测。
+2. 文件最顶上（`import numpy` 之前）用 `os.environ.setdefault` 把
+   `OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS` 设成 2——
+   这几个必须在 numpy 第一次被 import 之前设置才有效，只有在这个进程里
+   `plugins.obstacle` 是第一个 import numpy 的模块时才生效（比如
+   config.yaml 只开了 `obstacle` 这一个插件的场景）；如果 `main.py`
+   先加载了别的也用 numpy 的插件，这里设置就晚了，需要在容器启动层面
+   （Dockerfile ENV 或启动脚本）设同名变量才能保证生效。
+
+**没有做的事**：没有因为怀疑 RANSAC/中值滤波拖慢了推理就把这次加回来的
+地面剔除撤掉——线程过度订阅这个假设能解释"变慢一个数量级"这个量级，
+纯 numpy 矩阵运算本身（50 次 RANSAC 迭代，几万个点的向量化点积）在
+任何正常线程配置下都不应该到秒级，档次上对不上，不像"过度订阅"这个
+解释吻合，所以判断它不是主因，先不动。
+
+**下一步如果这次改动还是没解决**：说明瓶颈可能确实纯粹是这颗真实评测
+CPU 太弱（比如 Jetson 实测算力），或者是 ROS2/Docker 本身的开销，
+需要能登上那台真实机器（或者至少拿到那次运行的 `docker stats`/CPU
+配额信息）才能进一步定位，本地这台开发机器已经明确测不出这个问题
+（36 核、没有 cgroup 限制）。
+
 ## 已知局限（诚实说明近似之处）
 
 - outdoor 场景直接用 ROI 内深度分位数近似"最近障碍物距离"，没有做

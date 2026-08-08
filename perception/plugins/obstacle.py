@@ -21,6 +21,21 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+# 2026-08-08：跟 _load_models() 里给 onnxruntime SessionOptions 显式限定
+# intra_op_num_threads 是同一类问题的另一半——numpy/scipy 的中值滤波、
+# RANSAC 矩阵运算走的是底层 BLAS 线程池（OpenBLAS/MKL），默认同样按宿主机
+# 可见核数起线程，不感知容器 cgroup 配额。这几个环境变量必须在 numpy 第一次
+# 被 import 之前设置才有效（BLAS 线程池在库加载时初始化），所以放在本文件
+# 最顶上、`import numpy` 之前。用 setdefault：如果外层（Dockerfile/启动
+# 脚本）已经显式配置过，不覆盖。
+# 已知局限：只有当这个进程里 obstacle 插件是第一个 import numpy 的模块时
+# 才生效——如果 main.py 先加载了 ocr/vop 等其他也用 numpy 的插件，
+# BLAS 线程池早就初始化完了，这里再设置不起作用，需要在容器启动层面设置
+# 同名环境变量才能保证生效。
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -604,6 +619,28 @@ class LocalDistanceAdapter(DistanceAdapter):
 
         providers = self._resolve_providers()
 
+        # 2026-08-08：真实评测环境连续出现"每帧都卡到 2.7s 超时兜底、
+        # 且容器最终 OOM(退出码137)"的模式，跟 OBSTACLE.md 里 2026-08-05
+        # 就记录过的"indoor/outdoor 单帧延迟在真实环境分别约20s/40s、本地
+        # 测不出来"是同一个老问题。这里默认不传 SessionOptions，
+        # intra_op_num_threads 是 0（= onnxruntime 自动探测），自动探测在
+        # 容器里是已知的坑：它按宿主机能看到的 CPU 核数（这台开发机是36）
+        # 建线程池，不一定感知 Docker/K8s 的 cgroup CPU 配额——如果真实
+        # 评测容器配额很小（比如1-2核）但宿主机核数很多，ORT 会建一个远超
+        # 实际配额的线程池，导致大量线程互相抢占被 CFS 节流（推理速度可以
+        # 慢一个数量级，能解释20-40s这种量级的延迟），线程本身的栈内存和
+        # 调度开销也会推高内存占用（两个 session 各建一次线程池，可能是
+        # 反复 OOM 的另一个诱因）。本地这台开发机核数多、没有 cgroup 限制，
+        # 测不出这个问题（自动探测在这台机器上刚好也表现正常），这是这次
+        # 没能在本地复现、只能先按最佳实践改的地方——显式限定成一个较小的
+        # 固定线程数，不管宿主机报多少核，都不会过度订阅。真实评测环境的
+        # CPU 配额未知，默认给 2（明显小于绝大多数容器配额，足够安全），
+        # 可以通过 OBSTACLE_LOCAL_INTRA_OP_THREADS 环境变量按实际配额调。
+        intra_threads = int(os.environ.get("OBSTACLE_LOCAL_INTRA_OP_THREADS", "2"))
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = intra_threads
+        sess_options.inter_op_num_threads = 1  # 单条推理图，没有需要并行调度的独立子图
+
         for domain, filename in self._MODEL_FILENAME.items():
             path = self.model_dir / filename
             if not path.exists():
@@ -616,11 +653,12 @@ class LocalDistanceAdapter(DistanceAdapter):
                             f"exceeds {self._MODEL_SIZE_BUDGET_MB}MB budget")
 
             try:
-                session = ort.InferenceSession(str(path), providers=providers)
+                session = ort.InferenceSession(str(path), sess_options=sess_options, providers=providers)
             except Exception as e:
                 log.error(f"[obstacle][local] failed to load {path} with providers={providers}: {e}; "
                           f"retrying with CPUExecutionProvider only")
-                session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+                session = ort.InferenceSession(str(path), sess_options=sess_options,
+                                                providers=["CPUExecutionProvider"])
 
             actual_providers = session.get_providers()
             log.info(f"[obstacle][local] loaded {domain} model: {path.name} "
